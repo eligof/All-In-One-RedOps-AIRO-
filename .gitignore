@@ -1,0 +1,14 @@
+# Generated artifacts
+airo-redops-v3.2.0/
+airo-redops-v3.2.0.tar.gz
+__pycache__/
+*.pyc
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
