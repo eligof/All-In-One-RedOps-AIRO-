@@ -24,7 +24,7 @@ install_available_apt_pkgs() {
   local available=()
   local missing=()
   for pkg in "${pkgs[@]}"; do
-    if apt-cache show "$pkg" >/dev/null 2>&1; then
+    if apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2}' | grep -vq "(none)"; then
       available+=("$pkg")
     else
       missing+=("$pkg")
@@ -76,7 +76,8 @@ if ! command_exists aws; then
   echo "[*] awscli not found; attempting pip install (user scope)"
   pip3 install --user awscli || true
   if ! command_exists aws; then
-    echo "[!] awscli still missing. Ensure ~/.local/bin is on PATH."
+    echo "[!] awscli still missing. Ensure ~/.local/bin is on PATH:"
+    echo "    export PATH=\"$HOME/.local/bin:\$PATH\""
   fi
 fi
 
