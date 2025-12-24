@@ -1,0 +1,24 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build package
+        run: python airo-splitter.py
+      - name: Shell syntax check
+        run: |
+          bash -n airo-redops-v3.2.0/airo-core.sh
+          bash -n airo-redops-v3.2.0/install.sh
+          bash -n airo-redops-v3.2.0/uninstall.sh
+          find airo-redops-v3.2.0/modules -name '*.sh' -exec bash -n {} \;
+      - name: Python tests
+        run: python -m pytest -q

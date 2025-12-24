@@ -6,6 +6,9 @@ Creates a complete modular structure from the monolithic script
 
 from pathlib import Path
 import textwrap
+import hashlib
+import urllib.request
+import json
 
 def create_directory_structure():
     """Create directory structure"""
@@ -18,6 +21,7 @@ def create_directory_structure():
         base_dir / "docs",
         base_dir / "tools",
         base_dir / "tools" / "peas",
+        base_dir / "vendors",
     ]
     
     for d in dirs:
@@ -25,22 +29,267 @@ def create_directory_structure():
     
     return base_dir
 
+def download_with_verify(url: str, dest: Path, expected_sha256: str):
+    """Download a file and verify SHA256. Raises on mismatch."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
+        data = r.read()
+        f.write(data)
+    sha = hashlib.sha256(data).hexdigest()
+    if expected_sha256 and sha.lower() != expected_sha256.lower():
+        dest.unlink(missing_ok=True)
+        raise ValueError(f"SHA256 mismatch for {dest}: got {sha}, expected {expected_sha256}")
+
 def create_install_script(base_dir):
     """Create main installer script"""
-    # Read the Bash installer script from a separate template file for clarity
-    template_path = base_dir / "install.sh.template"
-    if template_path.exists():
-        with open(template_path, "r") as f:
-            install_content = f.read()
-    else:
-        # Fallback template if install.sh.template is missing
-        install_content = textwrap.dedent("""\
+    install_content = textwrap.dedent("""\
         #!/usr/bin/env bash
         set -euo pipefail
 
-        echo "[!] install.sh.template not found."
-        echo "[!] Provide a template or adjust create_install_script() to generate a real installer."
-        exit 1
+        XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+        XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+        XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+        AIRO_HOME="${AIRO_HOME:-$XDG_DATA_HOME/airo}"
+        AIRO_CONFIG_DIR="${AIRO_CONFIG_DIR:-$XDG_CONFIG_HOME/airo}"
+        AIRO_CACHE_DIR="${AIRO_CACHE_DIR:-$XDG_CACHE_HOME/airo}"
+        BIN_TARGET="/usr/local/bin/airo"
+        MANIFEST="$AIRO_HOME/install-manifest.txt"
+        AIRO_YES="${AIRO_YES:-0}"
+
+        confirm() {
+            local prompt="$1"
+            if [[ -t 0 ]]; then
+                read -p "$prompt" -r
+                [[ $REPLY =~ ^[Yy]$ ]]
+                return
+            fi
+            if [[ "$AIRO_YES" == "1" ]]; then
+                return 0
+            fi
+            echo "[-] Non-interactive shell. Set AIRO_YES=1 to proceed."
+            return 1
+        }
+        SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        AIRO_YES="${AIRO_YES:-0}"
+
+        confirm() {
+            local prompt="$1"
+            if [[ -t 0 ]]; then
+                read -p "$prompt" -r
+                [[ $REPLY =~ ^[Yy]$ ]]
+                return
+            fi
+            if [[ "$AIRO_YES" == "1" ]]; then
+                return 0
+            fi
+            echo "[-] Non-interactive shell. Set AIRO_YES=1 to proceed."
+            return 1
+        }
+
+        rollback() {
+            echo "[-] Install failed; rolling back..."
+            if [[ -d "$AIRO_HOME" ]]; then
+                rm -rf "$AIRO_HOME" || true
+            fi
+            if [[ -L "$BIN_TARGET" ]]; then
+                sudo rm -f "$BIN_TARGET" || true
+            fi
+        }
+        trap rollback ERR
+
+        echo "[*] AIRO will be installed to $AIRO_HOME"
+        echo "[*] Config directory: $AIRO_CONFIG_DIR"
+        echo "[*] Cache directory: $AIRO_CACHE_DIR"
+        if ! confirm "Proceed with install? [y/N]: "; then
+            echo "[-] Install cancelled"
+            exit 1
+        fi
+
+        echo "[*] Creating directories"
+        rm -rf "$AIRO_HOME"
+        mkdir -p "$AIRO_HOME" "$AIRO_CONFIG_DIR" "$AIRO_CACHE_DIR"
+
+        echo "[*] Copying framework files..."
+        cp -a "$SRC_DIR"/{airo-core.sh,modules,config,plugins,docs,tools,vendors} "$AIRO_HOME"/ 2>/dev/null || true
+        cp -a "$SRC_DIR"/install_airo_dependencies.sh "$AIRO_HOME"/ 2>/dev/null || true
+        cp -a "$SRC_DIR"/config/. "$AIRO_CONFIG_DIR"/ 2>/dev/null || true
+
+        echo "[*] Writing manifest at $MANIFEST"
+        find "$AIRO_HOME" -mindepth 1 -printf "%p\\n" | sort > "$MANIFEST"
+        if [[ -d "$AIRO_CONFIG_DIR" ]]; then
+            find "$AIRO_CONFIG_DIR" -mindepth 1 -printf "%p\\n" | sort >> "$MANIFEST"
+            echo "$AIRO_CONFIG_DIR" >> "$MANIFEST"
+        fi
+        if [[ -d "$AIRO_CACHE_DIR" ]]; then
+            echo "$AIRO_CACHE_DIR" >> "$MANIFEST"
+        fi
+        echo "$BIN_TARGET" >> "$MANIFEST"
+
+        echo "[*] Creating launcher at $BIN_TARGET (sudo may be required)"
+        if confirm "Allow sudo to create / update launcher? [y/N]: "; then
+            if command -v sudo >/dev/null 2>&1; then
+                if [[ -t 0 ]]; then
+                    sudo ln -sf "$AIRO_HOME/airo-core.sh" "$BIN_TARGET" || echo "[!] Failed to create launcher"
+                else
+                    sudo -n ln -sf "$AIRO_HOME/airo-core.sh" "$BIN_TARGET" 2>/dev/null || echo "[!] sudo needs a TTY; skipping launcher"
+                fi
+            elif [[ $EUID -eq 0 ]]; then
+                ln -sf "$AIRO_HOME/airo-core.sh" "$BIN_TARGET" || echo "[!] Failed to create launcher"
+            else
+                echo "[!] sudo not available; cannot create launcher at $BIN_TARGET"
+            fi
+        else
+            echo "[!] Skipping launcher creation. Add to PATH manually if desired."
+        fi
+
+        echo "[*] Installing shell completions"
+        COMPLETIONS_DIR="$AIRO_CONFIG_DIR/completions"
+        mkdir -p "$COMPLETIONS_DIR"
+        cat > "$COMPLETIONS_DIR/airo.bash" << 'BASH_COMP'
+_airo_complete() {
+    local cur prev cmds
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    cmds="netscan portscan udpscan alivehosts dnscan safescan lhost myip tracer whoislookup dnsdump cidrcalc \
+webscan dirscan fuzzurl sqlcheck xsscheck takeover wpscan joomscan sslscan headerscan httpxprobe wayback katana nuclei \
+sysenum sudofind capfind cronfind procmon libfind serviceenum userenum \
+lpe wpe sudoexploit kernelcheck winprivesc linprivesc getpeas \
+awscheck azcheck gcpcheck s3scan ec2scan dockerscan kubescan containerbreak \
+adusers adgroups admachines bloodhound kerberoast asreproast goldenticket silverticket passpol gpppass \
+wifiscan wifiattack bluescan blueattack wpscrack handshake pmkidattack rfscan \
+apkanalyze apkdecompile ipascan androidscan iotscan firmwareextract bleenum \
+emailosint userosint phoneosint domainosint breachcheck leaksearch metadata imageosint \
+reconall vulnscan reportgen findings evidence timertrack notify \
+urldecode urlencode base64d base64e hexdump filetype calccidr shodanscan censysscan fofascan \
+help modules reload update version"
+    COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
+}
+complete -F _airo_complete airo
+BASH_COMP
+        cat > "$COMPLETIONS_DIR/airo.zsh" << 'ZSH_COMP'
+#compdef airo
+_airo() {
+  local -a commands
+  commands=(
+    'netscan:Network scan'
+    'portscan:TCP scan'
+    'udpscan:UDP scan'
+    'alivehosts:Ping sweep'
+    'dnscan:DNS subdomain scan'
+    'safescan:Safe scan'
+    'lhost:Local IP'
+    'myip:Public IP'
+    'tracer:Traceroute'
+    'whoislookup:WHOIS lookup'
+    'dnsdump:DNS records'
+    'cidrcalc:CIDR calculator'
+    'webscan:Web scan'
+    'dirscan:Directory scan'
+    'fuzzurl:URL fuzz'
+    'sqlcheck:SQLi check'
+    'xsscheck:XSS check'
+    'takeover:Subdomain takeover'
+    'wpscan:WordPress scan'
+    'joomscan:Joomla scan'
+    'sslscan:TLS scan'
+    'headerscan:HTTP headers'
+    'httpxprobe:HTTP probe'
+    'wayback:Wayback URLs'
+    'katana:Katana crawl'
+    'nuclei:Nuclei scan'
+    'sysenum:System enumeration'
+    'sudofind:SUID/SGID files'
+    'capfind:Capabilities'
+    'cronfind:Cron jobs'
+    'procmon:Process monitor'
+    'libfind:Library check'
+    'serviceenum:Service enum'
+    'userenum:User enum'
+    'lpe:Linux privesc'
+    'wpe:Windows privesc'
+    'sudoexploit:Sudo checks'
+    'kernelcheck:Kernel checks'
+    'winprivesc:Windows privesc'
+    'linprivesc:Linux privesc'
+    'getpeas:Download PEAS'
+    'awscheck:AWS checks'
+    'azcheck:Azure checks'
+    'gcpcheck:GCP checks'
+    's3scan:S3 scan'
+    'ec2scan:EC2 scan'
+    'dockerscan:Docker scan'
+    'kubescan:Kubernetes scan'
+    'containerbreak:Container breakout'
+    'adusers:AD users'
+    'adgroups:AD groups'
+    'admachines:AD machines'
+    'bloodhound:BloodHound'
+    'kerberoast:Kerberoast'
+    'asreproast:AS-REP roast'
+    'goldenticket:Golden ticket'
+    'silverticket:Silver ticket'
+    'passpol:Password policy'
+    'gpppass:GPP passwords'
+    'wifiscan:WiFi scan'
+    'wifiattack:WiFi attack'
+    'bluescan:Bluetooth scan'
+    'blueattack:Bluetooth attack'
+    'wpscrack:WPS crack'
+    'handshake:Handshake guide'
+    'pmkidattack:PMKID guide'
+    'rfscan:RF scan'
+    'apkanalyze:Analyze APK'
+    'apkdecompile:Decompile APK'
+    'ipascan:iOS scan'
+    'androidscan:Android scan'
+    'iotscan:IoT scan'
+    'firmwareextract:Firmware extract'
+    'bleenum:BLE enum'
+    'emailosint:Email OSINT'
+    'userosint:User OSINT'
+    'phoneosint:Phone OSINT'
+    'domainosint:Domain OSINT'
+    'breachcheck:Breach check'
+    'leaksearch:Leak search'
+    'metadata:Metadata'
+    'imageosint:Image OSINT'
+    'reconall:Recon automation'
+    'vulnscan:Vuln automation'
+    'reportgen:Report template'
+    'findings:Findings guide'
+    'evidence:Evidence guide'
+    'timertrack:Time tracking'
+    'notify:Notifications'
+    'urldecode:URL decode'
+    'urlencode:URL encode'
+    'base64d:Base64 decode'
+    'base64e:Base64 encode'
+    'hexdump:Hex dump'
+    'filetype:File type'
+    'calccidr:CIDR calc'
+    'shodanscan:Shodan'
+    'censysscan:Censys'
+    'fofascan:Fofa'
+    'help:Help'
+    'modules:Modules'
+    'reload:Reload config'
+    'update:Update'
+    'version:Version'
+  )
+  _describe 'command' commands
+}
+compdef _airo airo
+ZSH_COMP
+
+        if [[ -f "$HOME/.bashrc" ]] && ! grep -q "airo.bash" "$HOME/.bashrc"; then
+            echo "source \"$COMPLETIONS_DIR/airo.bash\"" >> "$HOME/.bashrc"
+        fi
+        if [[ -f "$HOME/.zshrc" ]] && ! grep -q "airo.zsh" "$HOME/.zshrc"; then
+            echo "source \"$COMPLETIONS_DIR/airo.zsh\"" >> "$HOME/.zshrc"
+        fi
+
+        trap - ERR
+        echo "[+] Install complete."
+        echo "[!] Reload your shell (e.g., 'source ~/.bashrc' or 'source ~/.zshrc')"
         """).lstrip("\n")
     (base_dir / "install.sh").write_text(install_content, encoding='utf-8')
     (base_dir / "install.sh").chmod(0o755)
@@ -51,26 +300,88 @@ def create_uninstall_script(base_dir):
         #!/usr/bin/env bash
         set -euo pipefail
 
-        AIRO_HOME="$HOME/.airo"
+        XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+        XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+        XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+        AIRO_HOME="${AIRO_HOME:-$XDG_DATA_HOME/airo}"
+        AIRO_CONFIG_DIR="${AIRO_CONFIG_DIR:-$XDG_CONFIG_HOME/airo}"
+        AIRO_CACHE_DIR="${AIRO_CACHE_DIR:-$XDG_CACHE_HOME/airo}"
         BIN_TARGET="/usr/local/bin/airo"
+        MANIFEST="$AIRO_HOME/install-manifest.txt"
 
         echo "[*] This will remove All In One RedOps (AIRO) from $AIRO_HOME"
-        read -p "Proceed? [y/N]: " -r
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "[*] Config directory: $AIRO_CONFIG_DIR"
+        echo "[*] Cache directory: $AIRO_CACHE_DIR"
+        if ! confirm "Proceed? [y/N]: "; then
             echo "[-] Uninstall cancelled"
             exit 0
         fi
 
-        if [[ -d "$AIRO_HOME" ]]; then
-            rm -rf "$AIRO_HOME"
-            echo "[+] Removed $AIRO_HOME"
+        if [[ -f "$MANIFEST" ]]; then
+            echo "[*] Removing files from manifest..."
+            if command -v tac >/dev/null 2>&1; then
+                tac "$MANIFEST"
+            else
+                awk '{lines[NR]=$0} END{for(i=NR;i>=1;i--) print lines[i]}' "$MANIFEST"
+            fi | while read -r path; do
+                if [[ -L "$path" ]]; then
+                    if command -v sudo >/dev/null 2>&1; then
+                        sudo rm -f "$path" || true
+                    else
+                        rm -f "$path" || true
+                    fi
+                elif [[ -f "$path" ]]; then
+                    rm -f "$path" || true
+                elif [[ -d "$path" ]]; then
+                    rm -rf "$path" || true
+                fi
+            done || true
         else
-            echo "[!] AIRO home not found at $AIRO_HOME"
+            echo "[!] Manifest not found; removing $AIRO_HOME and launcher if present."
+            rm -rf "$AIRO_HOME" 2>/dev/null || true
+            if [[ -L "$BIN_TARGET" ]]; then
+                sudo rm -f "$BIN_TARGET"
+            fi
+        fi
+
+        if [[ -d "$AIRO_HOME" ]]; then
+            rm -rf "$AIRO_HOME" || true
+            if [[ ! -d "$AIRO_HOME" ]]; then
+                echo "[+] Removed $AIRO_HOME"
+            else
+                echo "[!] Failed to remove $AIRO_HOME"
+            fi
+        fi
+
+        if [[ -d "$AIRO_CONFIG_DIR" ]]; then
+            rm -rf "$AIRO_CONFIG_DIR" || true
+            if [[ ! -d "$AIRO_CONFIG_DIR" ]]; then
+                echo "[+] Removed $AIRO_CONFIG_DIR"
+            else
+                echo "[!] Failed to remove $AIRO_CONFIG_DIR"
+            fi
+        fi
+
+        if [[ -d "$AIRO_CACHE_DIR" ]]; then
+            rm -rf "$AIRO_CACHE_DIR" || true
+            if [[ ! -d "$AIRO_CACHE_DIR" ]]; then
+                echo "[+] Removed $AIRO_CACHE_DIR"
+            else
+                echo "[!] Failed to remove $AIRO_CACHE_DIR"
+            fi
         fi
 
         if [[ -L "$BIN_TARGET" ]]; then
-            sudo rm -f "$BIN_TARGET"
-            echo "[+] Removed launcher symlink at $BIN_TARGET"
+            if command -v sudo >/dev/null 2>&1; then
+                sudo rm -f "$BIN_TARGET" || true
+            else
+                rm -f "$BIN_TARGET" || true
+            fi
+            if [[ ! -L "$BIN_TARGET" ]]; then
+                echo "[+] Removed launcher symlink at $BIN_TARGET"
+            else
+                echo "[!] Failed to remove launcher symlink at $BIN_TARGET"
+            fi
         elif [[ -f "$BIN_TARGET" ]]; then
             echo "[!] $BIN_TARGET exists but is not a symlink; skipping removal"
         fi
@@ -94,13 +405,29 @@ def create_core_loader(base_dir):
         - Sets the file permissions to executable (0o755).
     """
     core_content = '''#!/usr/bin/env bash
+set -euo pipefail
 # All In One RedOps (AIRO) Core Loader - Main framework file
 
 AIRO_VERSION="3.2.0"
-AIRO_HOME="$HOME/.airo"
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+AIRO_HOME="${AIRO_HOME:-$XDG_DATA_HOME/airo}"
+AIRO_CONFIG="${AIRO_CONFIG:-$XDG_CONFIG_HOME/airo}"
+AIRO_CACHE="${AIRO_CACHE:-$XDG_CACHE_HOME/airo}"
 AIRO_MODULES="$AIRO_HOME/modules"
-AIRO_CONFIG="$AIRO_HOME/config"
-AIRO_CACHE="$AIRO_HOME/cache"
+LEGACY_HOME="$HOME/.airo"
+DRY_RUN=0
+VERBOSE=0
+DEBUG=0
+LOG_DIR="$AIRO_CACHE/logs"
+LOG_FILE="$LOG_DIR/airo.log"
+JSON_LOGGING=0
+JSON_LOG_FILE="$LOG_DIR/commands.jsonl"
+PROXY=""
+TOR=0
+USER_AGENT=""
+JITTER=0
 
 # Color setup
 setup_colors() {
@@ -121,13 +448,168 @@ setup_colors() {
 # Logging functions
 log() { printf "${GREEN}[+]${NC} %s\\n" "$*"; }
 warn() { printf "${YELLOW}[!]${NC} %s\\n" "$*" >&2; }
-error() { printf "${RED}[-]${NC} %s\\n" "$*" >&2; }
+json_escape() {
+    local s="$1"
+    s="${s//\\\\/\\\\\\\\}"
+    s="${s//\"/\\\\\"}"
+    s="${s//$'\\n'/ }"
+    printf '%s' "$s"
+}
+rotate_log_file() {
+    local file="$1"
+    local max_size=10485760
+    if [[ -f "$file" ]]; then
+        local size
+        size=$(wc -c < "$file" 2>/dev/null || echo 0)
+        if (( size > max_size )); then
+            local i
+            for ((i=9; i>=1; i--)); do
+                if [[ -f "${file}.${i}" ]]; then
+                    mv "${file}.${i}" "${file}.$((i+1))" 2>/dev/null || true
+                fi
+            done
+            mv "$file" "${file}.1" 2>/dev/null || true
+        fi
+    fi
+}
+log_json_event() {
+    [[ "${JSON_LOGGING:-0}" -eq 1 ]] || return 0
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    rotate_log_file "$JSON_LOG_FILE"
+    local event="$1"; shift || true
+    local cmd="$1"; shift || true
+    local ts
+    ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    local args_json="["
+    local arg
+    for arg in "$@"; do
+        args_json+="\"$(json_escape "$arg")\","
+    done
+    args_json="${args_json%,}]"
+    printf '{"ts":"%s","event":"%s","cmd":"%s","args":%s}\\n' \\
+        "$ts" "$(json_escape "$event")" "$(json_escape "$cmd")" "$args_json" >> "$JSON_LOG_FILE" 2>/dev/null || true
+}
+log_error() {
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    rotate_log_file "$LOG_FILE"
+    printf '%s %s\\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+error() {
+    printf "${RED}[-]${NC} %s\\n" "$*" >&2
+    log_error "$*"
+}
+
+airo_curl() {
+    local args=()
+    [[ -n "$PROXY" ]] && args+=(--proxy "$PROXY")
+    [[ -n "$USER_AGENT" ]] && args+=(-A "$USER_AGENT")
+    curl "${args[@]}" "$@"
+}
+
+ensure_dirs() {
+    mkdir -p "$AIRO_HOME" "$AIRO_CONFIG" "$AIRO_CACHE" "$LOG_DIR"
+}
+
+migrate_legacy_home() {
+    if [[ -d "$LEGACY_HOME" && ! -d "$AIRO_HOME" ]]; then
+        mkdir -p "$(dirname "$AIRO_HOME")"
+        if mv "$LEGACY_HOME" "$AIRO_HOME" 2>/dev/null; then
+            ln -s "$AIRO_HOME" "$LEGACY_HOME" 2>/dev/null || true
+            warn "Migrated legacy $LEGACY_HOME to $AIRO_HOME"
+        fi
+    fi
+    if [[ -d "$AIRO_HOME/config" && ! -d "$AIRO_CONFIG" ]]; then
+        mkdir -p "$AIRO_CONFIG"
+        cp -a "$AIRO_HOME/config/." "$AIRO_CONFIG"/ 2>/dev/null || true
+    fi
+}
+
+trim() {
+    local s="$1"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+load_ini_config() {
+    local ini="$AIRO_CONFIG/config.ini"
+    [[ -f "$ini" ]] || return 0
+    local section=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%%#*}"
+        line="${line%%;*}"
+        line="$(trim "$line")"
+        [[ -z "$line" ]] && continue
+        if [[ "$line" =~ ^\\[(.*)\\]$ ]]; then
+            section="${BASH_REMATCH[1]}"
+            continue
+        fi
+        if [[ "$line" == *=* ]]; then
+            local key val
+            key="$(trim "${line%%=*}")"
+            val="$(trim "${line#*=}")"
+            case "$key" in
+                SAFE_MODE) SAFE_MODE="$val" ;;
+                SCAN_DELAY) SCAN_DELAY="$val" ;;
+                RATE_LIMIT) RATE_LIMIT="$val" ;;
+                MAX_HOSTS) MAX_HOSTS="$val" ;;
+                TOOL_TIMEOUT) TOOL_TIMEOUT="$val" ;;
+                AUTO_LOAD_MODULES) AUTO_LOAD_MODULES="$val" ;;
+                AUDIT_LOGGING) AUDIT_LOGGING="$val" ;;
+                WORDLIST_BASE) WORDLIST_BASE="$val" ;;
+                WORDLIST_DIRSCAN) WORDLIST_DIRSCAN="$val" ;;
+                WORDLIST_FUZZURL) WORDLIST_FUZZURL="$val" ;;
+                PROXY) PROXY="$val" ;;
+                TOR) TOR="$val" ;;
+                USER_AGENT) USER_AGENT="$val" ;;
+                JITTER) JITTER="$val" ;;
+                JSON_LOGGING) JSON_LOGGING="$val" ;;
+                DEBUG) DEBUG="$val" ;;
+            esac
+        fi
+    done < "$ini"
+}
+
+apply_env_overrides() {
+    [[ -n "${AIRO_SAFE_MODE-}" ]] && SAFE_MODE="$AIRO_SAFE_MODE"
+    [[ -n "${AIRO_SCAN_DELAY-}" ]] && SCAN_DELAY="$AIRO_SCAN_DELAY"
+    [[ -n "${AIRO_RATE_LIMIT-}" ]] && RATE_LIMIT="$AIRO_RATE_LIMIT"
+    [[ -n "${AIRO_MAX_HOSTS-}" ]] && MAX_HOSTS="$AIRO_MAX_HOSTS"
+    [[ -n "${AIRO_TOOL_TIMEOUT-}" ]] && TOOL_TIMEOUT="$AIRO_TOOL_TIMEOUT"
+    [[ -n "${AIRO_AUTO_LOAD_MODULES-}" ]] && AUTO_LOAD_MODULES="$AIRO_AUTO_LOAD_MODULES"
+    [[ -n "${AIRO_AUDIT_LOGGING-}" ]] && AUDIT_LOGGING="$AIRO_AUDIT_LOGGING"
+    [[ -n "${AIRO_WORDLIST_BASE-}" ]] && WORDLIST_BASE="$AIRO_WORDLIST_BASE"
+    [[ -n "${AIRO_WORDLIST_DIRSCAN-}" ]] && WORDLIST_DIRSCAN="$AIRO_WORDLIST_DIRSCAN"
+    [[ -n "${AIRO_WORDLIST_FUZZURL-}" ]] && WORDLIST_FUZZURL="$AIRO_WORDLIST_FUZZURL"
+    [[ -n "${AIRO_DEBUG-}" ]] && DEBUG="$AIRO_DEBUG"
+    [[ -n "${AIRO_PROXY-}" ]] && PROXY="$AIRO_PROXY"
+    [[ -n "${AIRO_TOR-}" ]] && TOR="$AIRO_TOR"
+    [[ -n "${AIRO_USER_AGENT-}" ]] && USER_AGENT="$AIRO_USER_AGENT"
+    [[ -n "${AIRO_JITTER-}" ]] && JITTER="$AIRO_JITTER"
+    [[ -n "${AIRO_JSON_LOG-}" ]] && JSON_LOGGING="$AIRO_JSON_LOG"
+}
 
 # Load configuration
 load_config() {
-    if [[ -f "$AIRO_CONFIG/main.conf" ]]; then
-        source "$AIRO_CONFIG/main.conf"
+    ensure_dirs
+    migrate_legacy_home
+    if [[ -f "$AIRO_CONFIG/defaults.conf" ]]; then
+        if ! source "$AIRO_CONFIG/defaults.conf"; then
+            warn "Failed to load config: $AIRO_CONFIG/defaults.conf"
+        fi
     fi
+    if [[ -f "$AIRO_CONFIG/main.conf" ]]; then
+        if ! source "$AIRO_CONFIG/main.conf"; then
+            warn "Failed to load config: $AIRO_CONFIG/main.conf"
+        fi
+    fi
+    if [[ -f "$AIRO_CONFIG/user.conf" ]]; then
+        if ! source "$AIRO_CONFIG/user.conf"; then
+            warn "Failed to load config: $AIRO_CONFIG/user.conf"
+        fi
+    fi
+    load_ini_config
+    apply_env_overrides
     
     # Set defaults
     : ${SCAN_DELAY:=0.5}
@@ -140,20 +622,33 @@ load_config() {
     : ${WORDLIST_BASE:=$HOME/SecLists}
     : ${WORDLIST_DIRSCAN:=$WORDLIST_BASE/Discovery/Web-Content/common.txt}
     : ${WORDLIST_FUZZURL:=$WORDLIST_BASE/Discovery/Web-Content/raft-medium-words.txt}
+    : ${JSON_LOGGING:=0}
+    : ${PROXY:=}
+    : ${TOR:=0}
+    : ${USER_AGENT:=}
+    : ${JITTER:=0}
     
     export SCAN_DELAY RATE_LIMIT SAFE_MODE AUTO_LOAD_MODULES AUDIT_LOGGING
     export MAX_HOSTS TOOL_TIMEOUT WORDLIST_BASE WORDLIST_DIRSCAN WORDLIST_FUZZURL
+    export AIRO_HOME AIRO_CONFIG AIRO_CACHE AIRO_MODULES
+    export JSON_LOGGING PROXY TOR USER_AGENT JITTER DEBUG
 }
 
 # Apply runtime flags (e.g., --fast/--delay/--rate-limit/--safe)
 apply_runtime_flags() {
     RUNTIME_ARGS=()
+    UNSAFE_REQUESTED=0
+    FORCE_UNSAFE=0
     while (($#)); do
         case "$1" in
             --fast|--unsafe)
+                UNSAFE_REQUESTED=1
                 SAFE_MODE=0
                 SCAN_DELAY=0
                 RATE_LIMIT=${RATE_LIMIT:-10000}
+                ;;
+            --force)
+                FORCE_UNSAFE=1
                 ;;
             --safe)
                 SAFE_MODE=1
@@ -173,6 +668,51 @@ apply_runtime_flags() {
             --rate-limit)
                 [[ -n "${2-}" ]] && RATE_LIMIT="$2" && shift
                 ;;
+            --dry-run)
+                DRY_RUN=1
+                ;;
+            --no-dry-run)
+                DRY_RUN=0
+                ;;
+            --verbose)
+                VERBOSE=1
+                ;;
+            --debug)
+                DEBUG=1
+                ;;
+            --no-debug)
+                DEBUG=0
+                ;;
+            --proxy=*)
+                PROXY="${1#--proxy=}"
+                ;;
+            --proxy)
+                [[ -n "${2-}" ]] && PROXY="$2" && shift
+                ;;
+            --tor)
+                TOR=1
+                ;;
+            --user-agent=*)
+                USER_AGENT="${1#--user-agent=}"
+                ;;
+            --user-agent|--ua)
+                [[ -n "${2-}" ]] && USER_AGENT="$2" && shift
+                ;;
+            --ua=*)
+                USER_AGENT="${1#--ua=}"
+                ;;
+            --jitter=*)
+                JITTER="${1#--jitter=}"
+                ;;
+            --jitter)
+                [[ -n "${2-}" ]] && JITTER="$2" && shift
+                ;;
+            --json-log)
+                JSON_LOGGING=1
+                ;;
+            --no-json-log)
+                JSON_LOGGING=0
+                ;;
             --)
                 shift
                 RUNTIME_ARGS+=("$@")
@@ -184,18 +724,48 @@ apply_runtime_flags() {
         esac
         shift || break
     done
-    export SAFE_MODE SCAN_DELAY RATE_LIMIT
+    if [[ $UNSAFE_REQUESTED -eq 1 && $FORCE_UNSAFE -ne 1 ]]; then
+        echo "[-] Unsafe/fast mode requested but --force not provided. Aborting." >&2
+        exit 1
+    fi
+    if [[ $UNSAFE_REQUESTED -eq 1 ]]; then
+        echo "[!] UNSAFE MODE: Prompts disabled, delays removed, rate limit raised."
+    fi
+    # Enforce minimum rate limit of 10
+    if [[ -n "${RATE_LIMIT:-}" ]]; then
+        if (( $(printf "%.0f" "${RATE_LIMIT%%.*}") < 10 )); then
+            RATE_LIMIT=10
+            echo "[!] RATE_LIMIT raised to minimum of 10 req/sec for safety."
+        fi
+    fi
+    if [[ "${TOR:-0}" -eq 1 && -z "$PROXY" ]]; then
+        PROXY="socks5h://127.0.0.1:9050"
+    fi
+    if [[ -n "$PROXY" ]]; then
+        export HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY" ALL_PROXY="$PROXY"
+    fi
+    if [[ -n "$JITTER" && "$JITTER" != "0" ]]; then
+        SCAN_DELAY="$(awk -v base="$SCAN_DELAY" -v jitter="$JITTER" 'BEGIN{srand(); d=base+((rand()*2-1)*jitter); if(d<0){d=0} printf "%.3f", d}')"
+    fi
+    export SAFE_MODE SCAN_DELAY RATE_LIMIT DRY_RUN VERBOSE DEBUG
+    export JSON_LOGGING PROXY TOR USER_AGENT JITTER
 }
 
 # Load a specific module
 load_module() {
     local module="$1"
     if [[ -f "$AIRO_MODULES/$module.sh" ]]; then
-        source "$AIRO_MODULES/$module.sh"
-        return 0
+        if source "$AIRO_MODULES/$module.sh"; then
+            return 0
+        fi
+        warn "Failed to load module: $AIRO_MODULES/$module.sh"
+        return 1
     elif [[ -f "$AIRO_MODULES/$module" ]]; then
-        source "$AIRO_MODULES/$module"
-        return 0
+        if source "$AIRO_MODULES/$module"; then
+            return 0
+        fi
+        warn "Failed to load module: $AIRO_MODULES/$module"
+        return 1
     fi
     warn "Module not found: $module"
     return 1
@@ -205,7 +775,9 @@ load_module() {
 load_all_modules() {
     for module in "$AIRO_MODULES"/*.sh; do
         if [[ -f "$module" ]]; then
-            source "$module"
+            if ! source "$module"; then
+                warn "Failed to load module: $module"
+            fi
         fi
     done
 }
@@ -249,7 +821,32 @@ airo_lazy_load() {
     
     # Execute the command
     if declare -f "airo_$cmd" >/dev/null 2>&1; then
-        "airo_$cmd" "${@:2}"
+        local debug_was_on=0
+        log_json_event "command.start" "$cmd" "${@:2}"
+        if [[ "${DEBUG:-0}" -eq 1 ]]; then
+            debug_was_on=1
+            set -x
+        fi
+        if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
+            echo "[dry-run] airo $cmd ${*:2}"
+            if [[ "${VERBOSE:-0}" -eq 1 ]]; then
+                echo "[dry-run] Would execute function: airo_$cmd"
+            fi
+            log_json_event "command.dry_run" "$cmd" "${@:2}"
+            return 0
+        fi
+        if ! "airo_$cmd" "${@:2}"; then
+            local status=$?
+            if [[ $debug_was_on -eq 1 ]]; then
+                set +x
+            fi
+            log_json_event "command.error" "$cmd" "${@:2}"
+            return $status
+        fi
+        if [[ $debug_was_on -eq 1 ]]; then
+            set +x
+        fi
+        log_json_event "command.end" "$cmd" "${@:2}"
     else
         error "Command not found: $cmd"
         return 1
@@ -258,12 +855,13 @@ airo_lazy_load() {
 
 # Main airo command
 airo() {
-    local cmd="$1"
-    shift || true
+    local cmd=""
     apply_runtime_flags "$@"
     set -- "${RUNTIME_ARGS[@]}"
+    cmd="${1:-}"
+    shift || true
     
-    if [[ -z "$cmd" ]]; then
+    if [[ -z "$cmd" ]] || [[ "$cmd" == "--help" ]] || [[ "$cmd" == "-h" ]]; then
         cat << HELP
 All In One RedOps (AIRO) v${AIRO_VERSION}
 Modular Edition with 150+ commands
@@ -277,11 +875,23 @@ Usage:
   airo update                - Update framework
   airo version               - Show version
 Flags:
-  --fast / --unsafe          - SAFE_MODE=0, SCAN_DELAY=0, RATE_LIMIT=10000
+  --fast / --unsafe          - SAFE_MODE=0, SCAN_DELAY=0, RATE_LIMIT=10000 (requires --force)
   --safe                     - SAFE_MODE=1 (re-enable prompts)
   --no-delay                 - SCAN_DELAY=0
   --delay=<seconds>          - Set SCAN_DELAY
   --rate-limit=<pps>         - Set RATE_LIMIT (packets per second)
+  --force                    - Required with --fast/--unsafe
+  --dry-run                  - Show what would run without executing
+  --verbose                  - More detail with --dry-run
+  --debug                    - Enable bash tracing for commands
+  --no-debug                 - Disable bash tracing
+  --proxy <url>              - Route HTTP(S) tools through proxy
+  --tor                      - Use Tor (socks5h://127.0.0.1:9050)
+  --user-agent <ua>          - Set custom User-Agent
+  --ua <ua>                  - Alias for --user-agent
+  --jitter <seconds>         - Add random delay jitter to scans
+  --json-log                 - Enable JSON command logging
+  --no-json-log              - Disable JSON command logging
 
 Examples:
   airo netscan --fast 192.168.1.0/24
@@ -296,9 +906,18 @@ HELP
         help)
             airo ""  # Show help
             ;;
+        --help|-h)
+            airo ""
+            ;;
         modules)
             echo "Available modules:"
-            ls -1 "$AIRO_MODULES"/*.sh | xargs -I {} basename {} .sh | sort
+            if command -v xargs >/dev/null 2>&1; then
+                ls -1 "$AIRO_MODULES"/*.sh 2>/dev/null | xargs -I {} basename {} .sh | sort || true
+            else
+                for file in "$AIRO_MODULES"/*.sh; do
+                    [[ -f "$file" ]] && basename "$file" .sh
+                done | sort || true
+            fi
             ;;
         reload)
             load_config
@@ -312,7 +931,7 @@ HELP
             ;;
         *)
             # Try lazy loading
-            airo_lazy_load "$@"
+            airo_lazy_load "$cmd" "$@"
             ;;
     esac
 }
@@ -341,11 +960,21 @@ create_aliases() {
 setup_completion() {
     if [[ -n "$BASH_VERSION" ]]; then
         # Bash completion
-        complete -W "$(compgen -c | grep ^airo_ | sed 's/^airo_//')" airo
+        if [[ -f "$AIRO_CONFIG/completions/airo.bash" ]]; then
+            # shellcheck source=/dev/null
+            source "$AIRO_CONFIG/completions/airo.bash"
+        else
+            complete -W "$(compgen -c | grep ^airo_ | sed 's/^airo_//' || true)" airo
+        fi
     elif [[ -n "$ZSH_VERSION" ]]; then
         # Zsh completion
-        autoload -Uz compinit
-        compinit
+        if [[ -f "$AIRO_CONFIG/completions/airo.zsh" ]]; then
+            # shellcheck source=/dev/null
+            source "$AIRO_CONFIG/completions/airo.zsh"
+        else
+            autoload -Uz compinit
+            compinit
+        fi
     fi
 }
 
@@ -375,6 +1004,7 @@ init_framework() {
 def create_module_network(base_dir):
     """Create network module"""
     network_content = '''#!/usr/bin/env bash
+set -euo pipefail
 # Network Reconnaissance Module
 # 12 network reconnaissance commands
 
@@ -402,25 +1032,30 @@ sudo_nmap_with_grc() {
     fi
 }
 
+net_usage() {
+    echo "Usage: $1 [target] [--ports <list>] [--top <n>] [--timeout <s>] [--output <file>]"
+}
+
 parse_net_flags() {
     PORTS=""
     TOP_PORTS=""
     HOST_TIMEOUT=""
     OUTFILE=""
-    while (($#)); do
+    if ! PARSED=$(getopt -o h --long ports:,top:,timeout:,output:,help -- "$@"); then
+        net_usage "$0"
+        return 1
+    fi
+    eval set -- "$PARSED"
+    while true; do
         case "$1" in
-            --ports=*) PORTS="${1#*=}" ;;
-            --ports) PORTS="$2"; shift ;;
-            --top=*) TOP_PORTS="${1#*=}" ;;
-            --top) TOP_PORTS="$2"; shift ;;
-            --timeout=*) HOST_TIMEOUT="${1#*=}" ;;
-            --timeout) HOST_TIMEOUT="$2"; shift ;;
-            --output=*) OUTFILE="${1#*=}" ;;
-            --output) OUTFILE="$2"; shift ;;
+            --ports) PORTS="$2"; shift 2 ;;
+            --top) TOP_PORTS="$2"; shift 2 ;;
+            --timeout) HOST_TIMEOUT="$2"; shift 2 ;;
+            --output) OUTFILE="$2"; shift 2 ;;
+            -h|--help) net_usage "$0"; return 1 ;;
             --) shift; break ;;
             *) break ;;
         esac
-        shift || break
     done
     REMAINING_ARGS=("$@")
 }
@@ -439,11 +1074,11 @@ airo_netscan(){
         local args=(-sn "$subnet")
         [[ -n "$HOST_TIMEOUT" ]] && args+=(--host-timeout "$HOST_TIMEOUT")
         if [[ -n "$OUTFILE" ]]; then
-            nmap_with_grc "${args[@]}" -oN "$OUTFILE"
-            echo "[+] Results saved to $OUTFILE"
-        else
-            nmap_with_grc "${args[@]}"
-        fi
+        nmap_with_grc "${args[@]}" -oN "$OUTFILE" || true
+        echo "[+] Results saved to $OUTFILE"
+    else
+        nmap_with_grc "${args[@]}" || true
+    fi
     else
         echo "[-] nmap not installed"
     fi
@@ -461,10 +1096,10 @@ airo_portscan() {
         [[ -n "$TOP_PORTS" ]] && args+=(--top-ports "$TOP_PORTS")
         [[ -n "$HOST_TIMEOUT" ]] && args+=(--host-timeout "$HOST_TIMEOUT")
         if [[ -n "$OUTFILE" ]]; then
-            nmap_with_grc "${args[@]}" -oN "$OUTFILE"
+            nmap_with_grc "${args[@]}" -oN "$OUTFILE" || true
             echo "[+] Results saved to $OUTFILE"
         else
-            nmap_with_grc "${args[@]}"
+            nmap_with_grc "${args[@]}" || true
         fi
     else
         echo "[-] nmap not installed"
@@ -483,10 +1118,10 @@ airo_udpscan() {
         [[ -n "$TOP_PORTS" ]] && args+=(--top-ports "$TOP_PORTS")
         [[ -n "$HOST_TIMEOUT" ]] && args+=(--host-timeout "$HOST_TIMEOUT")
         if [[ -n "$OUTFILE" ]]; then
-            sudo_nmap_with_grc "${args[@]}" -oN "$OUTFILE"
+            sudo_nmap_with_grc "${args[@]}" -oN "$OUTFILE" || true
             echo "[+] Results saved to $OUTFILE"
         else
-            sudo_nmap_with_grc "${args[@]}"
+            sudo_nmap_with_grc "${args[@]}" || true
         fi
     fi
 }
@@ -501,8 +1136,15 @@ airo_alivehosts() {
     fi
 
     echo "[*] Finding live hosts in $subnet..."
-    for i in $(seq 1 254); do
-        run_with_grc ping -c 1 -W 1 "${subnet%.*}.$i" | grep -q "64 bytes" && echo "${subnet%.*}.$i" &
+    if ! command -v ping >/dev/null 2>&1; then
+        echo "[-] ping not installed"
+        return 0
+    fi
+    local i
+    for ((i=1; i<=254; i++)); do
+        if run_with_grc ping -c 1 -W 1 "${subnet%.*}.$i" | grep -q "64 bytes"; then
+            echo "${subnet%.*}.$i"
+        fi &
     done
     wait
 }
@@ -511,11 +1153,16 @@ airo_dnscan() {
     local domain="${1:?Usage: dnscan <domain>}"
     
     echo "[*] Scanning $domain for subdomains..."
+
+    if ! command -v host >/dev/null 2>&1; then
+        echo "[-] host not installed"
+        return 0
+    fi
     
     # Simple subdomain brute force
     local words=(www ftp mail admin test dev staging api)
     for word in "${words[@]}"; do
-        host "$word.$domain" 2>/dev/null | grep -v "NXDOMAIN"
+        host "$word.$domain" 2>/dev/null | grep -v "NXDOMAIN" || true
     done
 }
 
@@ -529,31 +1176,39 @@ airo_safescan() {
     echo "[*] Safe scan: $target (delay: ${delay}s, rate: ${rate}pps)"
     
     if command -v nmap >/dev/null 2>&1; then
-        nmap_with_grc -T4 --max-rate "$rate" --scan-delay "${delay}s" "$target"
+        nmap_with_grc -T4 --max-rate "$rate" --scan-delay "${delay}s" "$target" || true
     else
-        run_with_grc ping -c 4 -i "$delay" "$target"
+        run_with_grc ping -c 4 -i "$delay" "$target" || true
     fi
 }
 
 airo_lhost() {
     local ip
-    ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1);exit}}')"
-    [[ -n "$ip" ]] || ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    if command -v ip >/dev/null 2>&1; then
+        ip="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1);exit}}' || true)"
+    fi
+    if [[ -z "$ip" ]] && command -v hostname >/dev/null 2>&1; then
+        ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    fi
     echo "$ip"
 }
 
 airo_myip() {
     echo "[*] Getting public IP..."
-    curl -fsSL ifconfig.me 2>/dev/null || curl -fsSL api.ipify.org 2>/dev/null || true
+    if command -v curl >/dev/null 2>&1; then
+        airo_curl -fsSL ifconfig.me 2>/dev/null || airo_curl -fsSL api.ipify.org 2>/dev/null || true
+    else
+        echo "[-] curl not installed"
+    fi
 }
 
 airo_tracer() {
     local target="${1:?Usage: tracer <host>}"
     
     if command -v traceroute >/dev/null 2>&1; then
-        run_with_grc traceroute -n "$target"
+        run_with_grc traceroute -n "$target" || true
     elif command -v tracepath >/dev/null 2>&1; then
-        run_with_grc tracepath "$target"
+        run_with_grc tracepath "$target" || true
     else
         echo "[-] No traceroute tool found"
     fi
@@ -563,7 +1218,7 @@ airo_whoislookup() {
     local target="${1:?Usage: whoislookup <domain/ip>}"
     
     if command -v whois >/dev/null 2>&1; then
-        run_with_grc whois "$target"
+        run_with_grc whois "$target" || true
     else
         echo "[-] whois not installed"
     fi
@@ -574,9 +1229,14 @@ airo_dnsdump() {
     
     echo "[*] DNS records for: $domain"
     
+    if ! command -v dig >/dev/null 2>&1; then
+        echo "[-] dig not installed"
+        return 0
+    fi
+
     for record in A AAAA MX TXT NS SOA; do
         echo -e "\\n$record:"
-        run_with_grc dig "$domain" "$record" +short 2>/dev/null
+        run_with_grc dig "$domain" "$record" +short 2>/dev/null || true
     done
 }
 
@@ -586,7 +1246,7 @@ airo_cidrcalc() {
     echo "[*] Calculating CIDR: $cidr"
     
     if command -v ipcalc >/dev/null 2>&1; then
-        ipcalc "$cidr"
+        ipcalc "$cidr" || true
     else
         echo "[-] ipcalc not installed"
     fi
@@ -604,6 +1264,7 @@ export -f airo_dnsdump airo_cidrcalc
 def create_module_web(base_dir):
     """Create web module"""
     web_content = '''#!/usr/bin/env bash
+set -euo pipefail
 # Web Assessment Module
 # 14 web security testing commands
 
@@ -648,18 +1309,24 @@ parse_web_flags() {
     DIR_THREADS=""
     DIR_EXTS=""
     FUZZ_THREADS=""
-    while (($#)); do
+    WORDLIST_OVERRIDE=""
+    if ! PARSED=$(getopt -o h --long wordlist:,threads:,extensions:,help -- "$@"); then
+        echo "Usage: <cmd> <url> [--wordlist <path|alias>] [--threads <n>] [--extensions ext,ext]"
+        return 1
+    fi
+    eval set -- "$PARSED"
+    while true; do
         case "$1" in
-            --wordlist=*) WORDLIST_OVERRIDE="${1#*=}" ;;
-            --wordlist) WORDLIST_OVERRIDE="$2"; shift ;;
-            --threads=*) DIR_THREADS="${1#*=}"; FUZZ_THREADS="${DIR_THREADS}";;
-            --threads) DIR_THREADS="$2"; FUZZ_THREADS="$2"; shift ;;
-            --extensions=*) DIR_EXTS="${1#*=}" ;;
-            --extensions) DIR_EXTS="$2"; shift ;;
+            --wordlist) WORDLIST_OVERRIDE="$2"; shift 2 ;;
+            --threads) DIR_THREADS="$2"; FUZZ_THREADS="$2"; shift 2 ;;
+            --extensions) DIR_EXTS="$2"; shift 2 ;;
+            -h|--help)
+                echo "Usage: <cmd> <url> [--wordlist <path|alias>] [--threads <n>] [--extensions ext,ext]"
+                return 1
+                ;;
             --) shift; break ;;
             *) break ;;
         esac
-        shift || break
     done
     REMAINING_ARGS=("$@")
 }
@@ -670,7 +1337,7 @@ airo_webscan() {
     echo "[*] Scanning $url..."
     
     if command -v nikto >/dev/null 2>&1; then
-        nikto -h "$url"
+        nikto -h "$url" || true
     else
         echo "[-] nikto not installed"
     fi
@@ -691,9 +1358,9 @@ airo_dirscan() {
         local args=(dir -u "$url" -w "$wordlist")
         [[ -n "$DIR_THREADS" ]] && args+=(-t "$DIR_THREADS")
         [[ -n "$DIR_EXTS" ]] && args+=(-x "$DIR_EXTS")
-        gobuster "${args[@]}"
+        gobuster "${args[@]}" || true
     elif command -v dirb >/dev/null 2>&1; then
-        dirb "$url" "$wordlist"
+        dirb "$url" "$wordlist" || true
     else
         echo "[-] No directory scanner found"
     fi
@@ -713,7 +1380,7 @@ airo_fuzzurl() {
     if command -v ffuf >/dev/null 2>&1; then
         local args=(-u "$url/FUZZ" -w "$wordlist")
         [[ -n "$FUZZ_THREADS" ]] && args+=(-t "$FUZZ_THREADS")
-        ffuf "${args[@]}"
+        ffuf "${args[@]}" || true
     else
         echo "[-] ffuf not installed"
     fi
@@ -731,7 +1398,7 @@ airo_httpxprobe() {
     [[ -n "$output" ]] && args+=(-o "$output")
     
     if command -v httpx >/dev/null 2>&1; then
-        httpx "${args[@]}"
+        httpx "${args[@]}" || true
     else
         echo "[-] httpx not installed (projectdiscovery)."
     fi
@@ -742,15 +1409,15 @@ airo_wayback() {
     local output="${2:-}"
     if command -v gau >/dev/null 2>&1; then
         if [[ -n "$output" ]]; then
-            gau "$domain" -o "$output"
+            gau "$domain" -o "$output" || true
         else
-            gau "$domain"
+            gau "$domain" || true
         fi
     elif command -v waybackurls >/dev/null 2>&1; then
         if [[ -n "$output" ]]; then
-            waybackurls "$domain" > "$output"
+            waybackurls "$domain" > "$output" || true
         else
-            waybackurls "$domain"
+            waybackurls "$domain" || true
         fi
     else
         echo "[-] gau or waybackurls not installed"
@@ -762,9 +1429,9 @@ airo_katana() {
     local output="${2:-}"
     if command -v katana >/dev/null 2>&1; then
         if [[ -n "$output" ]]; then
-            katana -u "$target" -o "$output"
+            katana -u "$target" -o "$output" || true
         else
-            katana -u "$target"
+            katana -u "$target" || true
         fi
     else
         echo "[-] katana not installed (projectdiscovery)."
@@ -803,7 +1470,7 @@ airo_nuclei() {
         [[ -n "$severity" ]] && args+=(-severity "$severity")
         [[ -n "$rate" ]] && args+=(-rate "$rate")
         [[ -n "$output" ]] && args+=(-o "$output")
-        nuclei "${args[@]}"
+        nuclei "${args[@]}" || true
     else
         echo "[-] nuclei not installed (projectdiscovery)."
     fi
@@ -820,7 +1487,7 @@ airo_sqlcheck() {
     echo "[*] Testing $url for SQL injection..."
     
     if command -v sqlmap >/dev/null 2>&1; then
-        sqlmap -u "$url" --batch
+        sqlmap -u "$url" --batch || true
     else
         echo "[-] sqlmap not installed"
         echo "[*] Manual test: $url' OR '1'='1"
@@ -832,9 +1499,11 @@ airo_xsscheck() {
     
     echo "[*] XSS testing: $url"
     echo "[*] Test payloads:"
-    echo "  <script>alert('XSS')</script>"
-    echo "  \"><script>alert('XSS')</script>"
-    echo "  '><script>alert('XSS')</script>"
+    cat << 'XSS_PAYLOADS'
+  <script>alert('XSS')</script>
+  "><script>alert('XSS')</script>
+  '><script>alert('XSS')</script>
+XSS_PAYLOADS
 }
 
 airo_takeover() {
@@ -842,11 +1511,18 @@ airo_takeover() {
     
     echo "[*] Subdomain takeover check: $domain"
     echo "[*] Checking for vulnerable services..."
+
+    if ! command -v host >/dev/null 2>&1; then
+        echo "[-] host not installed"
+        return 0
+    fi
     
     # Simple check
     local subdomains=("www" "api" "dev" "staging" "test")
     for sub in "${subdomains[@]}"; do
-        host "$sub.$domain" 2>/dev/null | grep -i "not found\\|nxdomain" && echo "[+] Possible takeover: $sub.$domain"
+        if host "$sub.$domain" 2>/dev/null | grep -qi "not found\\|nxdomain"; then
+            echo "[+] Possible takeover: $sub.$domain"
+        fi
     done
 }
 
@@ -856,7 +1532,7 @@ airo_wpscan() {
     echo "[*] WordPress scan: $url"
     
     if command -v wpscan >/dev/null 2>&1; then
-        wpscan --url "$url" --enumerate vp,vt,u
+        wpscan --url "$url" --enumerate vp,vt,u || true
     else
         echo "[-] wpscan not installed"
     fi
@@ -866,7 +1542,7 @@ airo_joomscan() {
     local url="${1:?Usage: joomscan <url>}"
     
     if command -v joomscan >/dev/null 2>&1; then
-        joomscan -u "$url"
+        joomscan -u "$url" || true
     else
         echo "[-] joomscan not installed"
     fi
@@ -878,9 +1554,9 @@ airo_sslscan() {
     echo "[*] SSL scan: $target"
     
     if command -v sslscan >/dev/null 2>&1; then
-        sslscan "$target"
+        sslscan "$target" || true
     elif command -v testssl.sh >/dev/null 2>&1; then
-        testssl.sh "$target"
+        testssl.sh "$target" || true
     else
         echo "[-] No SSL scanner found"
     fi
@@ -890,7 +1566,11 @@ airo_headerscan() {
     local url="${1:?Usage: headerscan <url>}"
     
     echo "[*] HTTP headers: $url"
-    curl -s -I "$url" | grep -v ^$
+    if command -v curl >/dev/null 2>&1; then
+        airo_curl -s -I "$url" | grep -v '^$' || true
+    else
+        echo "[-] curl not installed"
+    fi
 }
 
 export -f airo_webscan airo_dirscan airo_fuzzurl airo_sqlcheck airo_xsscheck
@@ -904,76 +1584,129 @@ export -f airo_httpxprobe airo_wayback airo_katana airo_nuclei
 def create_module_system(base_dir):
     """Create system module"""
     system_content = '''#!/usr/bin/env bash
+set -euo pipefail
 # System Enumeration Module
 # 8 system enumeration commands
 
+sys_usage() {
+    echo "Usage: $1 [--help]"
+}
+
 airo_sysenum() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        sys_usage "airo_sysenum"
+        return 0
+    fi
     echo "[*] System enumeration started..."
     
     echo -e "\\n=== SYSTEM INFORMATION ==="
-    uname -a
+    uname -a || true
     
     echo -e "\\n=== USER INFO ==="
-    id
-    whoami
+    id || true
+    whoami || true
     
     echo -e "\\n=== NETWORK ==="
-    ip a 2>/dev/null || ifconfig
+    if command -v ip >/dev/null 2>&1; then
+        ip a 2>/dev/null || true
+    elif command -v ifconfig >/dev/null 2>&1; then
+        ifconfig 2>/dev/null || true
+    else
+        echo "[-] ip/ifconfig not available"
+    fi
     
     echo -e "\\n=== PROCESSES ==="
-    ps aux --sort=-%mem | head -20
+    if command -v ps >/dev/null 2>&1; then
+        ps aux --sort=-%mem | head -20 || true
+    else
+        echo "[-] ps not available"
+    fi
     
     echo -e "\\n=== SERVICES ==="
-    systemctl list-units --type=service --state=running 2>/dev/null || service --status-all 2>/dev/null
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl list-units --type=service --state=running 2>/dev/null || true
+    elif command -v service >/dev/null 2>&1; then
+        service --status-all 2>/dev/null || true
+    else
+        echo "[-] No service manager detected"
+    fi
     
     echo -e "\\n=== CRON JOBS ==="
-    crontab -l 2>/dev/null
-    ls -la /etc/cron* 2>/dev/null
+    crontab -l 2>/dev/null || true
+    ls -la /etc/cron* 2>/dev/null || true
 }
 
 airo_sudofind() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_sudofind"
+        return 0
+    fi
     echo "[*] Finding SUID/SGID files..."
-    find / -type f -perm -4000 -o -perm -2000 2>/dev/null | head -30
+    find / -type f \\( -perm -4000 -o -perm -2000 \\) 2>/dev/null | head -30 || true
 }
 
 airo_capfind() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_capfind"
+        return 0
+    fi
     echo "[*] Finding capability-enabled binaries..."
     
     if command -v getcap >/dev/null 2>&1; then
-        getcap -r / 2>/dev/null | head -30
+        getcap -r / 2>/dev/null | head -30 || true
     else
         echo "[-] getcap not available"
     fi
 }
 
 airo_cronfind() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_cronfind"
+        return 0
+    fi
     echo "[*] Listing cron jobs..."
     
     echo -e "\\nUser cron:"
     crontab -l 2>/dev/null || echo "No user cron"
     
     echo -e "\\nSystem cron:"
-    ls -la /etc/cron* 2>/dev/null
+    ls -la /etc/cron* 2>/dev/null || true
     
     echo -e "\\nSystemd timers:"
-    systemctl list-timers 2>/dev/null | head -20
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl list-timers 2>/dev/null | head -20 || true
+    else
+        echo "No systemd timers"
+    fi
 }
 
 airo_procmon() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_procmon"
+        return 0
+    fi
     echo "[*] Process monitoring (Ctrl+C to stop)..."
     
     if command -v watch >/dev/null 2>&1; then
-        watch -n 1 'ps aux --sort=-%cpu | head -20'
+        watch -n 1 'ps aux --sort=-%cpu | head -20' || true
     else
+        if ! command -v ps >/dev/null 2>&1; then
+            echo "[-] ps not available"
+            return 1
+        fi
         while true; do
-            clear
-            ps aux --sort=-%cpu | head -20
+            clear || true
+            ps aux --sort=-%cpu | head -20 || true
             sleep 2
         done
     fi
 }
 
 airo_libfind() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_libfind"
+        return 0
+    fi
     echo "[*] Checking for vulnerable libraries..."
     
     # Check common vulnerable libraries
@@ -987,36 +1720,50 @@ airo_libfind() {
 }
 
 airo_serviceenum() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_serviceenum"
+        return 0
+    fi
     echo "[*] Enumerating services..."
     
     # Systemd
     if command -v systemctl >/dev/null 2>&1; then
         echo -e "\\nSystemd Services:"
-        systemctl list-units --type=service --state=running
+        systemctl list-units --type=service --state=running 2>/dev/null || true
     fi
     
     # init.d
     if [[ -d /etc/init.d ]]; then
         echo -e "\\nInit.d Services:"
-        ls -la /etc/init.d/
+        ls -la /etc/init.d/ || true
     fi
     
     # Listening ports
     echo -e "\\nListening Ports:"
-    ss -tulpn 2>/dev/null || netstat -tulpn 2>/dev/null
+    if command -v ss >/dev/null 2>&1; then
+        ss -tulpn 2>/dev/null || true
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tulpn 2>/dev/null || true
+    else
+        echo "[-] ss/netstat not available"
+    fi
 }
 
 airo_userenum() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_userenum"
+        return 0
+    fi
     echo "[*] Enumerating users and groups..."
     
     echo -e "\\nUsers:"
-    cat /etc/passwd | cut -d: -f1,3,4,6,7 | head -20
+    cut -d: -f1,3,4,6,7 /etc/passwd | head -20 || true
     
     echo -e "\\nGroups:"
-    cat /etc/group | cut -d: -f1,3,4 | head -20
+    cut -d: -f1,3,4 /etc/group | head -20 || true
     
     echo -e "\\nLogged in users:"
-    who -a
+    who -a || true
 }
 
 export -f airo_sysenum airo_sudofind airo_capfind airo_cronfind airo_procmon
@@ -1029,36 +1776,108 @@ export -f airo_libfind airo_serviceenum airo_userenum
 def create_module_privesc(base_dir):
     """Create privilege escalation module"""
     privesc_content = '''#!/usr/bin/env bash
+set -euo pipefail
 # Privilege Escalation Module
 # 6 privilege escalation commands
+
+privesc_usage() {
+    echo "Usage: $1 [--help]"
+}
 
 PEAS_DIR="${PEAS_DIR:-$AIRO_HOME/tools/peas}"
 LINPEAS_URL="${LINPEAS_URL:-https://github.com/carlospolop/PEASS-ng/releases/latest/download/linpeas.sh}"
 WINPEAS_URL="${WINPEAS_URL:-https://github.com/carlospolop/PEASS-ng/releases/latest/download/winPEASx64.exe}"
+LINPEAS_SHA256="${LINPEAS_SHA256:-}"
+WINPEAS_SHA256="${WINPEAS_SHA256:-}"
 
 ensure_peas_dir() {
     mkdir -p "$PEAS_DIR"
 }
 
+load_peas_hashes() {
+    if [[ -n "$LINPEAS_SHA256" && -n "$WINPEAS_SHA256" ]]; then
+        return 0
+    fi
+    local vendors_path="${AIRO_HOME:-$HOME/.airo}/vendors/tools.json"
+    if [[ ! -f "$vendors_path" ]]; then
+        return 0
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        eval "$(python3 - <<'PY'
+import json, os
+base = os.environ.get("AIRO_HOME", os.path.expanduser("~/.airo"))
+vendors = os.path.join(base, "vendors", "tools.json")
+try:
+    with open(vendors, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    peas = data.get("peas", {})
+    lin = peas.get("linpeas", {}).get("sha256", "")
+    win = peas.get("winpeas", {}).get("sha256", "")
+    if lin:
+        print(f'export LINPEAS_SHA256="{lin}"')
+    if win:
+        print(f'export WINPEAS_SHA256="{win}"')
+except Exception:
+    pass
+PY
+        )"
+    fi
+}
+
 download_peas() {
+    load_peas_hashes
     ensure_peas_dir
     echo "[*] Downloading linPEAS to $PEAS_DIR/linpeas.sh"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$LINPEAS_URL" -o "$PEAS_DIR/linpeas.sh" || echo "[-] Failed to download linPEAS"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q "$LINPEAS_URL" -O "$PEAS_DIR/linpeas.sh" || echo "[-] Failed to download linPEAS"
+    if [[ -n "$LINPEAS_SHA256" ]]; then
+        if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PY' || echo "[-] Failed to download linPEAS (hash verification failed)"
+import hashlib, urllib.request, sys, os
+url = os.environ["LINPEAS_URL"]; dest = os.environ["PEAS_DIR"] + "/linpeas.sh"; expected = os.environ["LINPEAS_SHA256"]
+with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
+    data = r.read(); f.write(data)
+sha = hashlib.sha256(data).hexdigest()
+if sha.lower() != expected.lower():
+    os.remove(dest)
+    sys.exit(f"SHA256 mismatch for linPEAS: got {sha}, expected {expected}")
+PY
+        else
+            echo "[-] python3 not available for hash verification; skipping download"
+        fi
     else
-        echo "[-] Neither curl nor wget found; cannot download linPEAS"
+        if command -v curl >/dev/null 2>&1; then
+            airo_curl -fsSL "$LINPEAS_URL" -o "$PEAS_DIR/linpeas.sh" || echo "[-] Failed to download linPEAS"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q "$LINPEAS_URL" -O "$PEAS_DIR/linpeas.sh" || echo "[-] Failed to download linPEAS"
+        else
+            echo "[-] Neither curl nor wget found; cannot download linPEAS"
+        fi
     fi
     chmod +x "$PEAS_DIR/linpeas.sh" 2>/dev/null || true
 
     echo "[*] Downloading winPEAS (x64) to $PEAS_DIR/winPEASx64.exe"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$WINPEAS_URL" -o "$PEAS_DIR/winPEASx64.exe" || echo "[-] Failed to download winPEAS"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q "$WINPEAS_URL" -O "$PEAS_DIR/winPEASx64.exe" || echo "[-] Failed to download winPEAS"
+    if [[ -n "$WINPEAS_SHA256" ]]; then
+        if command -v python3 >/dev/null 2>&1; then
+            python3 - <<'PY' || echo "[-] Failed to download winPEAS (hash verification failed)"
+import hashlib, urllib.request, sys, os
+url = os.environ["WINPEAS_URL"]; dest = os.environ["PEAS_DIR"] + "/winPEASx64.exe"; expected = os.environ["WINPEAS_SHA256"]
+with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
+    data = r.read(); f.write(data)
+sha = hashlib.sha256(data).hexdigest()
+if sha.lower() != expected.lower():
+    os.remove(dest)
+    sys.exit(f"SHA256 mismatch for winPEAS: got {sha}, expected {expected}")
+PY
+        else
+            echo "[-] python3 not available for hash verification; skipping download"
+        fi
     else
-        echo "[-] Neither curl nor wget found; cannot download winPEAS"
+        if command -v curl >/dev/null 2>&1; then
+            airo_curl -fsSL "$WINPEAS_URL" -o "$PEAS_DIR/winPEASx64.exe" || echo "[-] Failed to download winPEAS"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q "$WINPEAS_URL" -O "$PEAS_DIR/winPEASx64.exe" || echo "[-] Failed to download winPEAS"
+        else
+            echo "[-] Neither curl nor wget found; cannot download winPEAS"
+        fi
     fi
 }
 
@@ -1069,29 +1888,37 @@ airo_getpeas() {
 }
 
 airo_lpe() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        privesc_usage "airo_lpe"
+        return 0
+    fi
     echo "[*] Linux Privilege Escalation Checks"
     
     echo -e "\\n1. Kernel & OS Info:"
-    uname -a
+    uname -a || true
     cat /etc/*release 2>/dev/null || true
     
     echo -e "\\n2. Sudo Permissions:"
     sudo -l 2>/dev/null || echo "No sudo access"
     
     echo -e "\\n3. SUID/SGID Files:"
-    find / -type f -perm -4000 -o -perm -2000 2>/dev/null | head -20
+    find / -type f \\( -perm -4000 -o -perm -2000 \\) 2>/dev/null | head -20 || true
     
     echo -e "\\n4. Writable Files:"
-    find / -writable 2>/dev/null | head -20
+    find / -writable 2>/dev/null | head -20 || true
     
     echo -e "\\n5. Cron Jobs:"
-    crontab -l 2>/dev/null
-    ls -la /etc/cron* 2>/dev/null
+    crontab -l 2>/dev/null || true
+    ls -la /etc/cron* 2>/dev/null || true
     
     echo -e "\\n[*] Consider running linpeas for detailed check (download with: airo getpeas)"
 }
 
 airo_wpe() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        privesc_usage "airo_wpe"
+        return 0
+    fi
     echo "[*] Windows Privilege Escalation Checklist"
     
     cat << 'WIN_PRIVESC'
@@ -1123,7 +1950,11 @@ WIN_PRIVESC
 }
 
 airo_sudoexploit() {
-    local version="$(sudo --version 2>/dev/null | head -1 | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+')"
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        privesc_usage "airo_sudoexploit"
+        return 0
+    fi
+    local version="$(sudo --version 2>/dev/null | head -1 | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' || true)"
     
     if [[ -n "$version" ]]; then
         echo "[*] Sudo version: $version"
@@ -1134,7 +1965,15 @@ airo_sudoexploit() {
 }
 
 airo_kernelcheck() {
-    local kernel="$(uname -r)"
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        privesc_usage "airo_kernelcheck"
+        return 0
+    fi
+    local kernel="$(uname -r 2>/dev/null || true)"
+    if [[ -z "$kernel" ]]; then
+        echo "[-] Unable to determine kernel version"
+        return 1
+    fi
     echo "[*] Kernel version: $kernel"
     echo "[*] Check for exploits:"
     echo "  searchsploit $kernel"
@@ -1160,18 +1999,27 @@ def create_module_cloud(base_dir):
     """Create cloud module"""
     # Use raw string to avoid escape sequence warnings
     cloud_content = r'''#!/usr/bin/env bash
+set -euo pipefail
 # Cloud Security Module
 # 8 cloud security commands
 
+cloud_usage() {
+    echo "Usage: $1 [--help]"
+}
+
 airo_awscheck() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cloud_usage "airo_awscheck"
+        return 0
+    fi
     echo "[*] Checking AWS configuration..."
     
     if command -v aws >/dev/null 2>&1; then
         echo -e "\nAWS CLI Version:"
-        aws --version
+        aws --version 2>/dev/null || true
         
         echo -e "\nConfigured Profiles:"
-        aws configure list-profiles 2>/dev/null || cat ~/.aws/config 2>/dev/null | grep "^\[profile" || echo "No profiles found"
+        aws configure list-profiles 2>/dev/null || cat "$HOME/.aws/config" 2>/dev/null | grep "^\[profile" || echo "No profiles found"
         
         echo -e "\nCurrent Identity:"
         aws sts get-caller-identity 2>/dev/null || echo "Not authenticated"
@@ -1181,11 +2029,15 @@ airo_awscheck() {
 }
 
 airo_azcheck() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cloud_usage "airo_azcheck"
+        return 0
+    fi
     echo "[*] Checking Azure CLI configuration..."
     
     if command -v az >/dev/null 2>&1; then
         echo -e "\\nAzure CLI Version:"
-        az version --output table 2>/dev/null
+        az version --output table 2>/dev/null || true
         
         echo -e "\\nLogged-in account:"
         az account show --output table 2>/dev/null || echo "Not authenticated"
@@ -1195,11 +2047,15 @@ airo_azcheck() {
 }
 
 airo_gcpcheck() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cloud_usage "airo_gcpcheck"
+        return 0
+    fi
     echo "[*] Checking GCP CLI configuration..."
     
     if command -v gcloud >/dev/null 2>&1; then
         echo -e "\\nGCloud Version:"
-        gcloud --version | head -5
+        gcloud --version | head -5 || true
         
         echo -e "\\nActive config/account:"
         gcloud config list account --format 'value(core.account)' 2>/dev/null || echo "No active account"
@@ -1210,6 +2066,10 @@ airo_gcpcheck() {
 }
 
 airo_s3scan() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_s3scan <bucket>"
+        return 0
+    fi
     local bucket="${1:?Usage: s3scan <bucket>}"
     
     echo "[*] Checking S3 bucket: $bucket"
@@ -1222,15 +2082,19 @@ airo_s3scan() {
 }
 
 airo_ec2scan() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_ec2scan [region]"
+        return 0
+    fi
     local region="${1:-}"
     
     echo "[*] Listing EC2 instances${region:+ in $region}..."
     
     if command -v aws >/dev/null 2>&1; then
         if [[ -n "$region" ]]; then
-            aws ec2 describe-instances --region "$region" --query 'Reservations[].Instances[].InstanceId' --output table 2>/dev/null
+            aws ec2 describe-instances --region "$region" --query 'Reservations[].Instances[].InstanceId' --output table 2>/dev/null || true
         else
-            aws ec2 describe-instances --query 'Reservations[].Instances[].InstanceId' --output table 2>/dev/null
+            aws ec2 describe-instances --query 'Reservations[].Instances[].InstanceId' --output table 2>/dev/null || true
         fi
     else
         echo "[-] AWS CLI not installed"
@@ -1238,43 +2102,55 @@ airo_ec2scan() {
 }
 
 airo_dockerscan() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cloud_usage "airo_dockerscan"
+        return 0
+    fi
     echo "[*] Scanning Docker for misconfigurations..."
     
     if command -v docker >/dev/null 2>&1; then
         echo -e "\\nDocker Version:"
-        docker --version
+        docker --version || true
         
         echo -e "\\nRunning Containers:"
-        docker ps
+        docker ps 2>/dev/null || true
         
         echo -e "\\nAll Containers:"
-        docker ps -a
+        docker ps -a 2>/dev/null || true
         
         echo -e "\\nImages:"
-        docker images
+        docker images 2>/dev/null || true
     else
         echo "[-] Docker not installed"
     fi
 }
 
 airo_kubescan() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cloud_usage "airo_kubescan"
+        return 0
+    fi
     echo "[*] Scanning Kubernetes cluster..."
     
     if command -v kubectl >/dev/null 2>&1; then
         echo -e "\\nKubernetes Version:"
-        kubectl version --short
+        kubectl version --short 2>/dev/null || true
         
         echo -e "\\nNodes:"
-        kubectl get nodes
+        kubectl get nodes 2>/dev/null || true
         
         echo -e "\\nPods:"
-        kubectl get pods --all-namespaces
+        kubectl get pods --all-namespaces 2>/dev/null || true
     else
         echo "[-] kubectl not installed"
     fi
 }
 
 airo_containerbreak() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cloud_usage "airo_containerbreak"
+        return 0
+    fi
     echo "[*] Container Breakout Techniques"
     
     cat << 'CONTAINER_BREAK'
@@ -1311,48 +2187,69 @@ def create_module_ad(base_dir):
     """Create Active Directory module"""
     # Use double backslashes to escape the backslashes in Windows paths
     ad_content = r'''#!/usr/bin/env bash
+set -euo pipefail
 # Active Directory Module
 # 10 AD security commands
 
+ad_usage() {
+    echo "Usage: $1 [--help]"
+}
+
 airo_adusers() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_adusers <domain>"
+        return 0
+    fi
     local domain="${1:?Usage: adusers <domain>}"
     
     echo "[*] Enumerating AD users for: $domain"
     
     if command -v enum4linux >/dev/null 2>&1; then
-        enum4linux -U "$domain"
+        enum4linux -U "$domain" || true
     elif command -v ldapsearch >/dev/null 2>&1; then
-        ldapsearch -x -h "$domain" -b "dc=$(echo $domain | sed 's/\\./,dc=/g')" "(objectClass=user)" 2>/dev/null | grep -i samaccountname
+        ldapsearch -x -h "$domain" -b "dc=$(echo "$domain" | sed 's/\\./,dc=/g')" "(objectClass=user)" 2>/dev/null | grep -i samaccountname || true
     else
         echo "[-] No AD enumeration tools found"
     fi
 }
 
 airo_adgroups() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_adgroups <domain>"
+        return 0
+    fi
     local domain="${1:?Usage: adgroups <domain>}"
     
     echo "[*] Enumerating AD groups for: $domain"
     
     if command -v enum4linux >/dev/null 2>&1; then
-        enum4linux -G "$domain"
+        enum4linux -G "$domain" || true
     else
         echo "[-] enum4linux not installed"
     fi
 }
 
 airo_admachines() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_admachines <domain>"
+        return 0
+    fi
     local domain="${1:?Usage: admachines <domain>}"
     
     echo "[*] Listing domain computers for: $domain"
     
     if command -v nmap >/dev/null 2>&1; then
-        nmap -sS -p 445 --open "$domain/24" -oG - | grep Up | cut -d' ' -f2
+        nmap -sS -p 445 --open "$domain/24" -oG - | grep Up | cut -d' ' -f2 || true
     else
         echo "[-] nmap not installed"
     fi
 }
 
 airo_bloodhound() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        ad_usage "airo_bloodhound"
+        return 0
+    fi
     echo "[*] BloodHound setup guide"
     
     cat << 'BLOODHOUND'
@@ -1374,6 +2271,10 @@ BLOODHOUND
 }
 
 airo_kerberoast() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_kerberoast <domain>"
+        return 0
+    fi
     local domain="${1:?Usage: kerberoast <domain>}"
     
     echo "[*] Kerberoasting attack on: $domain"
@@ -1395,6 +2296,10 @@ KERBEROAST
 }
 
 airo_asreproast() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        ad_usage "airo_asreproast"
+        return 0
+    fi
     echo "[*] AS-REP Roasting attack"
     
     cat << 'ASREP'
@@ -1409,6 +2314,10 @@ ASREP
 }
 
 airo_goldenticket() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        ad_usage "airo_goldenticket"
+        return 0
+    fi
     echo "[*] Golden Ticket Attack"
     
     cat << 'GOLDEN'
@@ -1425,6 +2334,10 @@ GOLDEN
 }
 
 airo_silverticket() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        ad_usage "airo_silverticket"
+        return 0
+    fi
     echo "[*] Silver Ticket Attack"
     
     cat << 'SILVER'
@@ -1438,20 +2351,28 @@ SILVER
 }
 
 airo_passpol() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_passpol <domain>"
+        return 0
+    fi
     local domain="${1:?Usage: passpol <domain>}"
     
     echo "[*] Checking password policy for: $domain"
     
     if command -v crackmapexec >/dev/null 2>&1; then
-        crackmapexec smb "$domain" --pass-pol
+        crackmapexec smb "$domain" --pass-pol || true
     elif command -v enum4linux >/dev/null 2>&1; then
-        enum4linux -P "$domain"
+        enum4linux -P "$domain" || true
     else
         echo "[-] No tools available"
     fi
 }
 
 airo_gpppass() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        ad_usage "airo_gpppass"
+        return 0
+    fi
     echo "[*] Extracting GPP passwords..."
     
     cat << 'GPP'
@@ -1480,24 +2401,37 @@ export -f airo_asreproast airo_goldenticket airo_silverticket airo_passpol airo_
 def create_module_wireless(base_dir):
     """Create wireless module"""
     wireless_content = '''#!/usr/bin/env bash
+set -euo pipefail
 # Wireless Security Module
 # 8 wireless security commands
 
+wireless_usage() {
+    echo "Usage: $1 [--help]"
+}
+
 airo_wifiscan() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        wireless_usage "airo_wifiscan"
+        return 0
+    fi
     echo "[*] Scanning for WiFi networks..."
     
     if command -v iwconfig >/dev/null 2>&1; then
-        iwconfig 2>/dev/null | grep -i essid
+        iwconfig 2>/dev/null | grep -i essid || true
     fi
     
     if command -v nmcli >/dev/null 2>&1; then
-        nmcli dev wifi
+        nmcli dev wifi || true
     fi
     
     echo "[!] For detailed scanning, use: sudo airodump-ng wlan0mon"
 }
 
 airo_wifiattack() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_wifiattack <BSSID>"
+        return 0
+    fi
     local bssid="${1:?Usage: wifiattack <BSSID>}"
     
     echo "[*] WiFi Attack Menu - Target: $bssid"
@@ -1521,21 +2455,29 @@ WIFI_ATTACK
 }
 
 airo_bluescan() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        wireless_usage "airo_bluescan"
+        return 0
+    fi
     echo "[*] Scanning for Bluetooth devices..."
     
     if command -v hcitool >/dev/null 2>&1; then
-        hcitool scan
+        hcitool scan || true
     elif command -v bluetoothctl >/dev/null 2>&1; then
-        echo "scan on" | bluetoothctl
+        echo "scan on" | bluetoothctl || true
         sleep 5
-        echo "devices" | bluetoothctl
-        echo "scan off" | bluetoothctl
+        echo "devices" | bluetoothctl || true
+        echo "scan off" | bluetoothctl || true
     else
         echo "[-] Bluetooth tools not installed"
     fi
 }
 
 airo_blueattack() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_blueattack <BD_ADDR>"
+        return 0
+    fi
     local bdaddr="${1:?Usage: blueattack <BD_ADDR>}"
     
     echo "[*] Bluetooth Attack Menu - Target: $bdaddr"
@@ -1562,6 +2504,10 @@ BLUE_ATTACK
 }
 
 airo_wpscrack() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_wpscrack <BSSID>"
+        return 0
+    fi
     local bssid="${1:?Usage: wpscrack <BSSID>}"
     
     echo "[*] WPS PIN cracking: $bssid"
@@ -1575,6 +2521,10 @@ airo_wpscrack() {
 }
 
 airo_handshake() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_handshake <BSSID>"
+        return 0
+    fi
     local bssid="${1:?Usage: handshake <BSSID>}"
     
     echo "[*] Capture WPA Handshake Guide"
@@ -1661,10 +2611,19 @@ export -f airo_handshake airo_pmkidattack airo_rfscan
 def create_module_mobile(base_dir):
     """Create mobile/IoT module"""
     mobile_content = '''#!/usr/bin/env bash
+set -euo pipefail
 # Mobile & IoT Security Module
 # 7 mobile/IoT security commands
 
+mobile_usage() {
+    echo "Usage: $1 [--help]"
+}
+
 airo_apkanalyze() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_apkanalyze <path/to/app.apk>"
+        return 0
+    fi
     local apk="${1:?Usage: apkanalyze <path/to/app.apk>}"
     
     if [[ ! -f "$apk" ]]; then
@@ -1676,19 +2635,35 @@ airo_apkanalyze() {
     
     if command -v apktool >/dev/null 2>&1; then
         echo -e "\\nDecompiling APK:"
-        apktool d "$apk" -o apk_output 2>/dev/null && echo "[+] Decompiled to apk_output/"
+        if apktool d "$apk" -o apk_output 2>/dev/null; then
+            echo "[+] Decompiled to apk_output/"
+        else
+            echo "[-] apktool failed"
+        fi
     fi
     
     if command -v jadx >/dev/null 2>&1; then
         echo -e "\\nDecompiling to Java:"
-        jadx "$apk" -d jadx_output 2>/dev/null && echo "[+] Java source in jadx_output/"
+        if jadx "$apk" -d jadx_output 2>/dev/null; then
+            echo "[+] Java source in jadx_output/"
+        else
+            echo "[-] jadx failed"
+        fi
     fi
     
     echo -e "\\nExtracting contents:"
-    unzip -l "$apk" | head -20
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -l "$apk" | head -20 || true
+    else
+        echo "[-] unzip not installed"
+    fi
 }
 
 airo_apkdecompile() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_apkdecompile <path/to/app.apk> [outdir]"
+        return 0
+    fi
     local apk="${1:?Usage: apkdecompile <path/to/app.apk> [outdir] }"
     local outdir="${2:-apk_decompiled}"
     
@@ -1700,19 +2675,31 @@ airo_apkdecompile() {
     mkdir -p "$outdir"
     echo "[*] Decompiling APK to $outdir"
     if command -v apktool >/dev/null 2>&1; then
-        apktool d "$apk" -o "$outdir/apktool" >/dev/null && echo "[+] apktool output: $outdir/apktool"
+        if apktool d "$apk" -o "$outdir/apktool" >/dev/null; then
+            echo "[+] apktool output: $outdir/apktool"
+        else
+            echo "[-] apktool failed"
+        fi
     else
         echo "[-] apktool not installed"
     fi
     
     if command -v jadx >/dev/null 2>&1; then
-        jadx "$apk" -d "$outdir/jadx" >/dev/null && echo "[+] jadx output: $outdir/jadx"
+        if jadx "$apk" -d "$outdir/jadx" >/dev/null; then
+            echo "[+] jadx output: $outdir/jadx"
+        else
+            echo "[-] jadx failed"
+        fi
     else
         echo "[-] jadx not installed"
     fi
 }
 
 airo_ipascan() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_ipascan <ip_address>"
+        return 0
+    fi
     local ip="${1:?Usage: ipascan <ip_address>}"
     
     echo "[*] Scanning iOS app backend: $ip"
@@ -1722,6 +2709,10 @@ airo_ipascan() {
 }
 
 airo_androidscan() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_androidscan <ip_address>"
+        return 0
+    fi
     local ip="${1:?Usage: androidscan <ip_address>}"
     
     echo "[*] Scanning Android app backend: $ip"
@@ -1731,6 +2722,10 @@ airo_androidscan() {
 }
 
 airo_iotscan() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_iotscan <ip_address>"
+        return 0
+    fi
     local ip="${1:?Usage: iotscan <ip_address>}"
     
     echo "[*] Scanning IoT device: $ip"
@@ -1739,7 +2734,7 @@ airo_iotscan() {
     local iot_ports="21,22,23,80,81,443,554,8000,8080,8081,8443,8888,9000,49152"
     
     if command -v nmap >/dev/null 2>&1; then
-        nmap -sS -p "$iot_ports" "$ip"
+        nmap -sS -p "$iot_ports" "$ip" || true
     else
         echo "[-] nmap not installed"
     fi
@@ -1752,6 +2747,10 @@ airo_iotscan() {
 }
 
 airo_firmwareextract() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_firmwareextract <firmware_file>"
+        return 0
+    fi
     local firmware="${1:?Usage: firmwareextract <firmware_file>}"
     
     if [[ ! -f "$firmware" ]]; then
@@ -1762,15 +2761,19 @@ airo_firmwareextract() {
     echo "[*] Extracting firmware: $firmware"
     
     if command -v binwalk >/dev/null 2>&1; then
-        binwalk -e "$firmware"
+        binwalk -e "$firmware" || echo "[-] binwalk failed"
     elif command -v foremost >/dev/null 2>&1; then
-        foremost -i "$firmware" -o firmware_extracted
+        foremost -i "$firmware" -o firmware_extracted || echo "[-] foremost failed"
     else
         echo "[-] No extraction tools found"
     fi
 }
 
 airo_bleenum() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        mobile_usage "airo_bleenum"
+        return 0
+    fi
     echo "[*] Bluetooth Low Energy enumeration guide"
     
     cat << 'BLE_ENUM'
@@ -1814,10 +2817,19 @@ export -f airo_apkdecompile airo_firmwareextract airo_bleenum
 def create_module_osint(base_dir):
     """Create OSINT module"""
     osint_content = '''#!/usr/bin/env bash
+set -euo pipefail
 # OSINT Module
 # 8 OSINT commands
 
+osint_usage() {
+    echo "Usage: $1 [--help]"
+}
+
 airo_emailosint() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_emailosint <email_address>"
+        return 0
+    fi
     local email="${1:?Usage: emailosint <email_address>}"
     
     echo "[*] OSINT for email: $email"
@@ -1848,6 +2860,10 @@ EMAIL_OSINT
 }
 
 airo_userosint() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_userosint <username>"
+        return 0
+    fi
     local username="${1:?Usage: userosint <username>}"
     
     echo "[*] OSINT for username: $username"
@@ -1874,6 +2890,10 @@ USER_OSINT
 }
 
 airo_phoneosint() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_phoneosint <phone_number>"
+        return 0
+    fi
     local phone="${1:?Usage: phoneosint <phone_number>}"
     
     echo "[*] OSINT for phone: $phone"
@@ -1903,6 +2923,10 @@ PHONE_OSINT
 }
 
 airo_domainosint() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_domainosint <domain>"
+        return 0
+    fi
     local domain="${1:?Usage: domainosint <domain>}"
     
     echo "[*] Full domain OSINT: $domain"
@@ -1932,12 +2956,16 @@ DOMAIN_OSINT
 }
 
 airo_breachcheck() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_breachcheck <email>"
+        return 0
+    fi
     local email="${1:?Usage: breachcheck <email>}"
     
     echo "[*] Checking breaches for: $email"
     
     if command -v haveibeenpwned >/dev/null 2>&1; then
-        haveibeenpwned --email "$email"
+        haveibeenpwned --email "$email" || true
     else
         echo "[!] Install haveibeenpwned: pip3 install haveibeenpwned"
         echo "[!] Or check manually: https://haveibeenpwned.com"
@@ -1945,6 +2973,10 @@ airo_breachcheck() {
 }
 
 airo_leaksearch() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_leaksearch <search_term>"
+        return 0
+    fi
     local term="${1:?Usage: leaksearch <search_term>}"
     
     echo "[*] Searching leaked databases for: $term"
@@ -1969,6 +3001,10 @@ LEAK_SEARCH
 }
 
 airo_metadata() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_metadata <file>"
+        return 0
+    fi
     local file="${1:?Usage: metadata <file>}"
     
     if [[ ! -f "$file" ]]; then
@@ -1979,16 +3015,24 @@ airo_metadata() {
     echo "[*] Extracting metadata from: $file"
     
     if command -v exiftool >/dev/null 2>&1; then
-        exiftool "$file"
+        exiftool "$file" || true
     elif command -v file >/dev/null 2>&1; then
-        file "$file"
-        strings "$file" | head -50
+        file "$file" || true
+        if command -v strings >/dev/null 2>&1; then
+            strings "$file" | head -50 || true
+        else
+            echo "[-] strings not installed"
+        fi
     else
         echo "[-] exiftool not installed"
     fi
 }
 
 airo_imageosint() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        osint_usage "airo_imageosint"
+        return 0
+    fi
     echo "[*] Reverse image search guide"
     
     cat << 'IMAGE_OSINT'
@@ -2020,6 +3064,7 @@ export -f airo_breachcheck airo_leaksearch airo_metadata airo_imageosint
 def create_module_automation(base_dir):
     """Create automation module"""
     automation_content = '''#!/usr/bin/env bash
+set -euo pipefail
 # Automation Module
 # 7 automation commands
 
@@ -2031,22 +3076,32 @@ run_with_grc() {
     fi
 }
 
+automation_usage() {
+    echo "Usage: $1 [--help]"
+}
+
 airo_reconall() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_reconall <domain> [--out <dir>] [--target <domain>] [--nmap-opts \"...\"]"
+        return 0
+    fi
     local out_override=""
     local target_override=""
     local nmap_opts=""
-    while (($#)); do
+    if ! PARSED=$(getopt -o h --long out:,target:,nmap-opts:,help -- "$@"); then
+        echo "Usage: airo_reconall <domain> [--out <dir>] [--target <domain>] [--nmap-opts \"...\"]"
+        return 1
+    fi
+    eval set -- "$PARSED"
+    while true; do
         case "$1" in
-            --out=*) out_override="${1#*=}" ;;
-            --out) out_override="$2"; shift ;;
-            --target=*) target_override="${1#*=}" ;;
-            --target) target_override="$2"; shift ;;
-            --nmap-opts=*) nmap_opts="${1#*=}" ;;
-            --nmap-opts) nmap_opts="$2"; shift ;;
+            --out) out_override="$2"; shift 2 ;;
+            --target) target_override="$2"; shift 2 ;;
+            --nmap-opts) nmap_opts="$2"; shift 2 ;;
+            -h|--help) echo "Usage: airo_reconall <domain> [--out <dir>] [--target <domain>] [--nmap-opts \"...\"]"; return 0 ;;
             --) shift; break ;;
             *) break ;;
         esac
-        shift || break
     done
     local domain="${target_override:-${1:?Usage: reconall <domain> [--out <dir>] [--target <domain>] [--nmap-opts \"...\"]}}"
     
@@ -2061,27 +3116,32 @@ airo_reconall() {
     # Subdomain enumeration
     echo "[+] Enumerating subdomains..."
     if command -v subfinder >/dev/null 2>&1; then
-        subfinder -d "$domain" -o "$output_dir/subdomains.txt"
+        subfinder -d "$domain" -o "$output_dir/subdomains.txt" || true
     fi
     
     # DNS reconnaissance
     echo "[+] DNS reconnaissance..."
-    dig "$domain" ANY +noall +answer > "$output_dir/dns_any.txt"
+    if command -v dig >/dev/null 2>&1; then
+        dig "$domain" ANY +noall +answer > "$output_dir/dns_any.txt" || true
+    else
+        echo "[-] dig not installed; skipping DNS ANY lookup"
+    fi
     
     # Port scanning
     echo "[+] Port scanning..."
     if command -v nmap >/dev/null 2>&1; then
         if [[ -n "$nmap_opts" ]]; then
-            run_with_grc nmap $nmap_opts "$domain" -oN "$output_dir/nmap_quick.txt" &
+            read -r -a nmap_opts_arr <<< "$nmap_opts"
+            { run_with_grc nmap "${nmap_opts_arr[@]}" "$domain" -oN "$output_dir/nmap_quick.txt" || true; } &
         else
-            run_with_grc nmap -sS "$domain" -oN "$output_dir/nmap_quick.txt" &
+            { run_with_grc nmap -sS "$domain" -oN "$output_dir/nmap_quick.txt" || true; } &
         fi
     fi
     
     # Web reconnaissance
     echo "[+] Web technology detection..."
     if command -v whatweb >/dev/null 2>&1; then
-        whatweb "https://$domain" > "$output_dir/whatweb.txt" &
+        { whatweb "https://$domain" > "$output_dir/whatweb.txt" || true; } &
     fi
     
     wait
@@ -2091,24 +3151,29 @@ airo_reconall() {
 }
 
 airo_vulnscan() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_vulnscan <target> [--out <file>] [--target <target>] [--nmap-opts \"...\"] [--nikto-opts \"...\"]"
+        return 0
+    fi
     local out_override=""
     local target_override=""
     local nmap_opts=""
     local nikto_opts=""
-    while (($#)); do
+    if ! PARSED=$(getopt -o h --long out:,target:,nmap-opts:,nikto-opts:,help -- "$@"); then
+        echo "Usage: airo_vulnscan <target> [--out <file>] [--target <target>] [--nmap-opts \"...\"] [--nikto-opts \"...\"]"
+        return 1
+    fi
+    eval set -- "$PARSED"
+    while true; do
         case "$1" in
-            --out=*) out_override="${1#*=}" ;;
-            --out) out_override="$2"; shift ;;
-            --target=*) target_override="${1#*=}" ;;
-            --target) target_override="$2"; shift ;;
-            --nmap-opts=*) nmap_opts="${1#*=}" ;;
-            --nmap-opts) nmap_opts="$2"; shift ;;
-            --nikto-opts=*) nikto_opts="${1#*=}" ;;
-            --nikto-opts) nikto_opts="$2"; shift ;;
+            --out) out_override="$2"; shift 2 ;;
+            --target) target_override="$2"; shift 2 ;;
+            --nmap-opts) nmap_opts="$2"; shift 2 ;;
+            --nikto-opts) nikto_opts="$2"; shift 2 ;;
+            -h|--help) echo "Usage: airo_vulnscan <target> [--out <file>] [--target <target>] [--nmap-opts \"...\"] [--nikto-opts \"...\"]"; return 0 ;;
             --) shift; break ;;
             *) break ;;
         esac
-        shift || break
     done
     local target="${target_override:-${1:?Usage: vulnscan <target> [--out <file>] [--target <target>] [--nmap-opts \"...\"] [--nikto-opts \"...\"]}}"
     
@@ -2117,16 +3182,18 @@ airo_vulnscan() {
     if command -v nmap >/dev/null 2>&1; then
         echo "[+] Running Nmap vulnerability scripts..."
         if [[ -n "$nmap_opts" ]]; then
-            run_with_grc nmap $nmap_opts "$target"
+            read -r -a nmap_opts_arr <<< "$nmap_opts"
+            run_with_grc nmap "${nmap_opts_arr[@]}" "$target" || true
         else
-            run_with_grc nmap -sV --script vuln "$target"
+            run_with_grc nmap -sV --script vuln "$target" || true
         fi
     elif command -v nikto >/dev/null 2>&1; then
         echo "[+] Running Nikto web scanner..."
         if [[ -n "$nikto_opts" ]]; then
-            nikto -h "$target" $nikto_opts
+            read -r -a nikto_opts_arr <<< "$nikto_opts"
+            nikto -h "$target" "${nikto_opts_arr[@]}" || true
         else
-            nikto -h "$target"
+            nikto -h "$target" || true
         fi
     else
         echo "[-] No vulnerability scanner found"
@@ -2134,6 +3201,10 @@ airo_vulnscan() {
 }
 
 airo_reportgen() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        automation_usage "airo_reportgen"
+        return 0
+    fi
     echo "[*] Generating pentest report template"
     
     local report_dir="$HOME/pentest_reports/$(date +%Y%m%d)"
@@ -2195,6 +3266,10 @@ REPORT_TEMPLATE
 }
 
 airo_findings() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        automation_usage "airo_findings"
+        return 0
+    fi
     echo "[*] Findings management system"
     
     cat << 'FINDINGS'
@@ -2223,6 +3298,10 @@ FINDINGS
 }
 
 airo_evidence() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        automation_usage "airo_evidence"
+        return 0
+    fi
     echo "[*] Evidence collection guidelines"
     
     cat << 'EVIDENCE'
@@ -2247,15 +3326,21 @@ EVIDENCE
 }
 
 airo_timertrack() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        automation_usage "airo_timertrack"
+        return 0
+    fi
     echo "[*] Pentest time tracking"
     
-    local timer_file="$HOME/.airo_cache/timer.txt"
+    local cache_dir="${AIRO_CACHE:-$HOME/.airo_cache}"
+    mkdir -p "$cache_dir"
+    local timer_file="$cache_dir/timer.txt"
     
     if [[ ! -f "$timer_file" ]]; then
         echo "Start time: $(date)" > "$timer_file"
         echo "[+] Timer started at $(date)"
     else
-        local start_time="$(head -1 "$timer_file" | cut -d: -f2-)"
+        local start_time="$(head -1 "$timer_file" | cut -d: -f2- || true)"
         echo "[*] Timer started at: $start_time"
         echo "[*] Current time: $(date)"
         
@@ -2273,6 +3358,10 @@ airo_timertrack() {
 }
 
 airo_notify() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        automation_usage "airo_notify"
+        return 0
+    fi
     local message="${1:-Test notification from AIRO}"
     
     echo "[*] Sending notification: $message"
@@ -2292,38 +3381,79 @@ export -f airo_evidence airo_timertrack airo_notify
 def create_module_utilities(base_dir):
     """Create utilities module"""
     utilities_content = '''#!/usr/bin/env bash
+set -euo pipefail
 # Utilities Module
 # 10 utility commands
 
+util_usage() {
+    echo "Usage: $1 [--help]"
+}
+
 airo_urldecode() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_urldecode <string>"
+        return 0
+    fi
     local string="${1:?Usage: urldecode <string>}"
     
     echo "[*] URL decoding: $string"
-    python3 -c "import sys, urllib.parse as ul; print(ul.unquote_plus(sys.argv[1]))" "$string"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "import sys, urllib.parse as ul; print(ul.unquote_plus(sys.argv[1]))" "$string" || echo "[-] python3 failed"
+    else
+        echo "[-] python3 not installed"
+    fi
 }
 
 airo_urlencode() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_urlencode <string>"
+        return 0
+    fi
     local string="${1:?Usage: urlencode <string>}"
     
     echo "[*] URL encoding: $string"
-    python3 -c "import sys, urllib.parse as ul; print(ul.quote_plus(sys.argv[1]))" "$string"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "import sys, urllib.parse as ul; print(ul.quote_plus(sys.argv[1]))" "$string" || echo "[-] python3 failed"
+    else
+        echo "[-] python3 not installed"
+    fi
 }
 
 airo_base64d() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_base64d <string>"
+        return 0
+    fi
     local string="${1:?Usage: base64d <string>}"
     
     echo "[*] Base64 decoding: $string"
-    echo "$string" | base64 -d 2>/dev/null || echo "Invalid base64"
+    if command -v base64 >/dev/null 2>&1; then
+        echo "$string" | base64 -d 2>/dev/null || echo "Invalid base64"
+    else
+        echo "[-] base64 not installed"
+    fi
 }
 
 airo_base64e() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_base64e <string>"
+        return 0
+    fi
     local string="${1:?Usage: base64e <string>}"
     
     echo "[*] Base64 encoding: $string"
-    echo "$string" | base64
+    if command -v base64 >/dev/null 2>&1; then
+        echo "$string" | base64 || echo "[-] base64 failed"
+    else
+        echo "[-] base64 not installed"
+    fi
 }
 
 airo_hexdump() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_hexdump <file>"
+        return 0
+    fi
     local file="${1:?Usage: hexdump <file>}"
     
     if [[ ! -f "$file" ]]; then
@@ -2334,15 +3464,19 @@ airo_hexdump() {
     echo "[*] Hex dump of: $file"
     
     if command -v xxd >/dev/null 2>&1; then
-        xxd "$file"
+        xxd "$file" || true
     elif command -v hexdump >/dev/null 2>&1; then
-        hexdump -C "$file" | head -50
+        hexdump -C "$file" | head -50 || true
     else
         echo "[-] No hex dump tool found"
     fi
 }
 
 airo_filetype() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_filetype <file>"
+        return 0
+    fi
     local file="${1:?Usage: filetype <file>}"
     
     if [[ ! -f "$file" ]]; then
@@ -2356,22 +3490,36 @@ airo_filetype() {
         file "$file"
         
         echo -e "\\nFirst 64 bytes (hex):"
-        head -c 64 "$file" | xxd -p
+        if command -v xxd >/dev/null 2>&1; then
+            head -c 64 "$file" | xxd -p || true
+        elif command -v hexdump >/dev/null 2>&1; then
+            head -c 64 "$file" | hexdump -C || true
+        else
+            echo "[-] xxd/hexdump not found"
+        fi
         
         echo -e "\\nReadable strings:"
-        strings "$file" | head -20
+        if command -v strings >/dev/null 2>&1; then
+            strings "$file" | head -20 || true
+        else
+            echo "[-] strings not installed"
+        fi
     else
         echo "[-] file command not found"
     fi
 }
 
 airo_calccidr() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_calccidr <ip/cidr>"
+        return 0
+    fi
     local cidr="${1:?Usage: calccidr <ip/cidr>}"
     
     echo "[*] Calculating CIDR: $cidr"
     
     if command -v ipcalc >/dev/null 2>&1; then
-        ipcalc "$cidr"
+        ipcalc "$cidr" || true
     else
         echo "[-] ipcalc not installed"
         echo -e "\\nBasic CIDR ranges:"
@@ -2382,6 +3530,10 @@ airo_calccidr() {
 }
 
 airo_shodanscan() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_shodanscan <query>"
+        return 0
+    fi
     local query="${1:?Usage: shodanscan <query>}"
     
     echo "[*] Querying Shodan: $query"
@@ -2397,6 +3549,10 @@ airo_shodanscan() {
 }
 
 airo_censysscan() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_censysscan <query>"
+        return 0
+    fi
     local query="${1:?Usage: censysscan <query>}"
     
     echo "[*] Querying Censys: $query"
@@ -2412,6 +3568,10 @@ airo_censysscan() {
 }
 
 airo_fofascan() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        echo "Usage: airo_fofascan <query>"
+        return 0
+    fi
     local query="${1:?Usage: fofascan <query>}"
     
     echo "[*] Searching Fofa: $query"
@@ -2428,12 +3588,7 @@ Service Queries:
   • title="Welcome to nginx"
   • banner="Apache"
   • body="login"
-
-    (base_dir / "modules" / "utilities.sh").write_text(utilities_content, encoding='utf-8')
-    try:
-        (base_dir / "modules" / "utilities.sh").chmod(0o755)
-    except (AttributeError, NotImplementedError, PermissionError, OSError):
-        pass
+FOFA_SCAN
 }
 
 export -f airo_urldecode airo_urlencode airo_base64d airo_base64e airo_hexdump
@@ -2478,6 +3633,35 @@ WORDLIST_FUZZURL="$WORDLIST_BASE/Discovery/Web-Content/raft-medium-words.txt"
     
     (base_dir / "config" / "defaults.conf").write_text(config_content, encoding='utf-8')
     
+    ini_content = '''[defaults]
+SAFE_MODE=1
+AUDIT_LOGGING=1
+AUTO_LOAD_MODULES=1
+
+[scanning]
+SCAN_DELAY=0.5
+RATE_LIMIT=100
+MAX_HOSTS=254
+TOOL_TIMEOUT=10
+
+[paths]
+WORDLIST_BASE=$HOME/SecLists
+WORDLIST_DIRSCAN=$HOME/SecLists/Discovery/Web-Content/common.txt
+WORDLIST_FUZZURL=$HOME/SecLists/Discovery/Web-Content/raft-medium-words.txt
+
+[network]
+PROXY=
+TOR=0
+USER_AGENT=
+JITTER=0
+
+[logging]
+JSON_LOGGING=0
+DEBUG=0
+'''
+    
+    (base_dir / "config" / "config.ini").write_text(ini_content, encoding='utf-8')
+    
 # User config template
     user_config = '''# User Configuration Overrides
 # Place your custom settings here
@@ -2513,6 +3697,11 @@ All In One RedOps (AIRO) is a comprehensive penetration testing framework with m
 - **Configurable**: Easy to customize
 - **Safe Mode**: Confirmation for dangerous operations
 - **Rate Limiting**: Configurable scan speed
+- **XDG Support**: Config at `$XDG_CONFIG_HOME/airo`, data at `$XDG_DATA_HOME/airo`
+- **Dry-Run**: `--dry-run` shows what will run without executing
+- **Debug/Logs**: `--debug` tracing and errors logged under `$XDG_CACHE_HOME/airo/logs`
+- **Proxy/Tor/Jitter**: `--proxy`, `--tor`, `--jitter` for safer routing/pacing
+- **JSON Logging**: `--json-log` records command events to `$XDG_CACHE_HOME/airo/logs/commands.jsonl`
 - **Wordlists Ready**: Defaults point to SecLists under `$HOME/SecLists`; override via `WORDLIST_DIRSCAN` / `WORDLIST_FUZZURL`
 - **PEAS Helper**: `airo getpeas` downloads linPEAS/winPEAS into `$AIRO_HOME/tools/peas`
 - **Runtime Flags**: `--fast/--unsafe`, `--delay`, `--rate-limit`, `--safe` to toggle pacing and prompts per run
@@ -2533,7 +3722,7 @@ source ~/.bashrc  # or ~/.zshrc
 # Optional: set up wordlists (SecLists) and PEAS helpers
 git clone https://github.com/danielmiessler/SecLists.git ~/SecLists  # or point WORDLIST_BASE elsewhere
 airo getpeas  # download linPEAS/winPEAS into $AIRO_HOME/tools/peas
-# Flags (per run): --fast/--unsafe (SAFE_MODE=0, SCAN_DELAY=0, RATE_LIMIT=10000), --safe, --no-delay, --delay=<s>, --rate-limit=<pps>
+# Flags (per run): --fast/--unsafe (SAFE_MODE=0, SCAN_DELAY=0, RATE_LIMIT=10000), --safe, --no-delay, --delay=<s>, --rate-limit=<pps>, --dry-run, --verbose, --proxy, --tor, --user-agent/--ua, --jitter, --json-log
 '''
 
     (base_dir / "README.md").write_text(readme_content, encoding='utf-8')
@@ -2568,13 +3757,13 @@ airo getpeas  # download linPEAS/winPEAS into $AIRO_HOME/tools/peas
         sudo ./install.sh
         source ~/.bashrc   # or ~/.zshrc
         ```
-        - Installs to `$HOME/.airo`, symlink at `/usr/local/bin/airo`.
+        - Installs data to `$XDG_DATA_HOME/airo`, config to `$XDG_CONFIG_HOME/airo`, symlink at `/usr/local/bin/airo`.
         3) Uninstall:
         ```bash
         cd airo-redops-v3.2.0
         ./uninstall.sh
         ```
-        - Prompts, removes `$HOME/.airo`, and drops the symlink if it is a symlink.
+        - Prompts, removes `$XDG_DATA_HOME/airo` and `$XDG_CONFIG_HOME/airo`, and drops the symlink if it is a symlink.
 
         ## Using AIRO (basics)
         - Pattern: `airo <command> [args]` (lazy-loads the right module).
@@ -2583,12 +3772,13 @@ airo getpeas  # download linPEAS/winPEAS into $AIRO_HOME/tools/peas
         - Aliases: many commands are available as direct aliases (e.g., `netscan` → `airo netscan`).
 
         ## Configuration
-        - Defaults live in `config/defaults.conf` (copied to `$HOME/.airo/config/main.conf` on install).
-        - User overrides: copy `config/user.conf.example` to `$HOME/.airo/config/user.conf` and edit.
+        - Defaults live in `config/defaults.conf` (copied to `$XDG_CONFIG_HOME/airo/defaults.conf` on install).
+        - INI config lives at `$XDG_CONFIG_HOME/airo/config.ini` (optional).
+        - User overrides: copy `config/user.conf.example` to `$XDG_CONFIG_HOME/airo/user.conf` and edit.
         - Key knobs: `SAFE_MODE` (prompts for risky actions), `SCAN_DELAY`, `RATE_LIMIT`, `MAX_HOSTS`, `TOOL_TIMEOUT`, `AUTO_LOAD_MODULES`, `AUDIT_LOGGING`.
         - API keys: `SHODAN_API_KEY`, `CENSYS_API_ID`, `CENSYS_API_SECRET`, etc., go in your user config.
         - Wordlists: `WORDLIST_BASE` defaults to `$HOME/SecLists`; set `WORDLIST_DIRSCAN` and `WORDLIST_FUZZURL` to choose lists. Clone SecLists: `git clone https://github.com/danielmiessler/SecLists.git $WORDLIST_BASE`.
-        - Flags: per-run toggles `--fast/--unsafe` (SAFE_MODE=0, SCAN_DELAY=0, RATE_LIMIT=10000), `--safe`, `--no-delay`, `--delay=<s>`, `--rate-limit=<pps>`.
+        - Flags: per-run toggles `--fast/--unsafe` (SAFE_MODE=0, SCAN_DELAY=0, RATE_LIMIT=10000), `--safe`, `--no-delay`, `--delay=<s>`, `--rate-limit=<pps>`, `--dry-run`, `--verbose`, `--debug`, `--proxy`, `--tor`, `--user-agent/--ua`, `--jitter`, `--json-log`.
         - Command flags:
           - Network: `--ports`, `--top`, `--timeout`, `--output` (portscan/udpscan/netscan).
           - Web: `--wordlist <path|alias>`, `--threads <n>`, `--extensions ext,ext` (dirscan); `--wordlist`, `--threads` (fuzzurl).
@@ -2630,7 +3820,10 @@ airo getpeas  # download linPEAS/winPEAS into $AIRO_HOME/tools/peas
         - Redirect output when needed: `airo dnsdump example.com > dns.txt`.
 
         ## Outputs and Paths
-        - Framework installs to `$HOME/.airo`; modules live under `$HOME/.airo/modules`.
+        - Framework data installs to `$XDG_DATA_HOME/airo`; modules live under `$XDG_DATA_HOME/airo/modules`.
+        - Config lives under `$XDG_CONFIG_HOME/airo`; cache under `$XDG_CACHE_HOME/airo`.
+        - Error logs: `$XDG_CACHE_HOME/airo/logs/airo.log`.
+        - JSON logs: `$XDG_CACHE_HOME/airo/logs/commands.jsonl`.
         - `airo_reconall` writes to `~/recon/<domain>-YYYYMMDD/`.
         - `airo_reportgen` writes to `~/pentest_reports/DATE/report_template.md`.
 
@@ -2669,6 +3862,30 @@ airo getpeas  # download linPEAS/winPEAS into $AIRO_HOME/tools/peas
     (docs_dir / "DOCS.md").write_text(docs_content, encoding='utf-8')
     print(f"[+] Docs written to {docs_dir}")
 
+def create_vendor_files(base_dir):
+    """Create vendor metadata files (hashes/versions)"""
+    vendors_dir = base_dir / "vendors"
+    vendors_dir.mkdir(parents=True, exist_ok=True)
+    source = Path("vendors/tools.json")
+    if source.exists():
+        content = source.read_text(encoding='utf-8')
+    else:
+        content = textwrap.dedent("""\
+        {
+          "peas": {
+            "linpeas": {
+              "version": "latest",
+              "sha256": ""
+            },
+            "winpeas": {
+              "version": "latest",
+              "sha256": ""
+            }
+          }
+        }
+        """).lstrip("\n")
+    (vendors_dir / "tools.json").write_text(content, encoding='utf-8')
+
 def build_package():
     """Generate the full All In One RedOps (AIRO) package structure and files."""
     base_dir = create_directory_structure()
@@ -2688,6 +3905,7 @@ def build_package():
     create_module_utilities(base_dir)
     create_config_files(base_dir)
     create_documentation(base_dir)
+    create_vendor_files(base_dir)
     print(f"[+] Generated All In One RedOps (AIRO) package at {base_dir.resolve()}")
 
 if __name__ == "__main__":

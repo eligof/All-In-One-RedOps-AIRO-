@@ -1,0 +1,27 @@
+{
+  "httpx": {
+    "version": "v1.6.0",
+    "sha256": "<fill-after-download>",
+    "source": "https://github.com/projectdiscovery/httpx"
+  },
+  "katana": {
+    "version": "v1.0.5",
+    "sha256": "<fill-after-download>",
+    "source": "https://github.com/projectdiscovery/katana"
+  },
+  "nuclei": {
+    "version": "v3.2.0",
+    "sha256": "<fill-after-download>",
+    "source": "https://github.com/projectdiscovery/nuclei"
+  },
+  "gau": {
+    "version": "v2.1.2",
+    "sha256": "<fill-after-download>",
+    "source": "https://github.com/lc/gau"
+  },
+  "waybackurls": {
+    "version": "v0.1.0",
+    "sha256": "<fill-after-download>",
+    "source": "https://github.com/tomnomnom/waybackurls"
+  }
+}
