@@ -1235,6 +1235,10 @@ create_aliases() {
 
 # Setup completion
 setup_completion() {
+    # Skip completion setup in non-interactive shells to avoid exiting under set -e
+    if [[ $- != *i* ]]; then
+        return 0
+    fi
     if [[ -n "$BASH_VERSION" ]]; then
         # Bash completion
         if [[ -f "$AIRO_CONFIG/completions/airo.bash" ]]; then
