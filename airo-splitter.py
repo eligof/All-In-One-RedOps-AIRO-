@@ -53,8 +53,10 @@ def create_install_script(base_dir):
     template_path = Path("install.sh.template")
     deps_script = Path("scripts/install_airo_dependencies.sh")
     deps_body = ""
+    deps_body_raw = ""
     if deps_script.exists():
-        deps_body = deps_script.read_text(encoding="utf-8")
+        deps_body_raw = deps_script.read_text(encoding="utf-8")
+        deps_body = deps_body_raw
         if deps_body.startswith("#!"):
             deps_body = "\n".join(deps_body.splitlines()[1:])
     if deps_body.strip():
@@ -139,6 +141,10 @@ AIRO_DEPS
 
         echo "[*] Copying framework files..."
         cp -a "$SRC_DIR"/{airo-core.sh,modules,config,plugins,docs,tools,vendors} "$AIRO_HOME"/ 2>/dev/null || true
+        if [[ -f "$SRC_DIR/install_airo_dependencies.sh" ]]; then
+            cp "$SRC_DIR/install_airo_dependencies.sh" "$AIRO_HOME/" 2>/dev/null || true
+            chmod +x "$AIRO_HOME/install_airo_dependencies.sh" 2>/dev/null || true
+        fi
         cp -a "$SRC_DIR"/config/. "$AIRO_CONFIG_DIR"/ 2>/dev/null || true
 
         echo "[*] Writing manifest at $MANIFEST"
@@ -344,6 +350,10 @@ ZSH_COMP
         """).lstrip("\n")
     install_content = install_content.replace("{{AIRO_DEPS_BLOCK}}", deps_block.rstrip())
     write_versioned(base_dir / "install.sh", install_content)
+    if deps_body_raw.strip():
+        deps_target = base_dir / "install_airo_dependencies.sh"
+        deps_target.write_text(deps_body_raw, encoding="utf-8")
+        deps_target.chmod(0o755)
     (base_dir / "install.sh").chmod(0o755)
 
 def create_uninstall_script(base_dir):
@@ -490,9 +500,16 @@ set -euo pipefail
 # All In One RedOps (AIRO) Core Loader - Main framework file
 
 AIRO_VERSION="3.3.0"
-XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
-XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+AIRO_USER_HOME="${HOME}"
+if [[ "${EUID:-$(id -u)}" -eq 0 && -n "${SUDO_USER-}" && "${SUDO_USER}" != "root" ]]; then
+    AIRO_USER_HOME="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+    if [[ -z "$AIRO_USER_HOME" ]]; then
+        AIRO_USER_HOME="/home/$SUDO_USER"
+    fi
+fi
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$AIRO_USER_HOME/.config}"
+XDG_DATA_HOME="${XDG_DATA_HOME:-$AIRO_USER_HOME/.local/share}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$AIRO_USER_HOME/.cache}"
 AIRO_HOME="${AIRO_HOME:-$XDG_DATA_HOME/airo}"
 AIRO_CONFIG="${AIRO_CONFIG:-$XDG_CONFIG_HOME/airo}"
 AIRO_CACHE="${AIRO_CACHE:-$XDG_CACHE_HOME/airo}"
@@ -791,6 +808,7 @@ ensure_dirs() {
     mkdir -p "$AIRO_HOME" "$AIRO_CONFIG" "$AIRO_CACHE" "$LOG_DIR"
     if [[ -d "$AIRO_CACHE" ]]; then
         find "$AIRO_CACHE" -maxdepth 1 -name "banner.*" -type f -mtime +7 -delete 2>/dev/null || true
+        find "$AIRO_CACHE" -maxdepth 1 -name "impact.*" -type f -mtime +7 -delete 2>/dev/null || true
     fi
 }
 
@@ -1148,6 +1166,10 @@ impact_warning() {
     [[ "${IMPACT_WARNING:-1}" -eq 1 ]] || return 0
     [[ "${SAFE_MODE:-1}" -eq 1 ]] || return 0
     [[ "${NO_PROMPT:-0}" -eq 1 ]] && return 0
+    local impact_flag="$AIRO_CACHE/impact.${PPID}"
+    if [[ -f "$impact_flag" ]]; then
+        return 0
+    fi
     case "$cmd" in
         netscan|portscan|udpscan|alivehosts|dnscan|subdomain|safescan|webscan|dirscan|fuzzurl|sqlcheck|xsscheck|sslscan|wpscan|joomscan|httpxprobe|wayback|katana|nuclei|reconall|vulnscan)
             ;;
@@ -1158,8 +1180,10 @@ impact_warning() {
     if [[ -t 0 ]]; then
         read -p "[!] This command may generate scan traffic and impact targets. Proceed? [y/N]: " -r
         [[ $REPLY =~ ^[Yy]$ ]] || return 1
+        printf '%s\n' "$$" > "$impact_flag" 2>/dev/null || true
     else
         warn "Scan impact warning for $cmd (non-interactive; continuing)"
+        printf '%s\n' "$$" > "$impact_flag" 2>/dev/null || true
     fi
 }
 
@@ -1624,8 +1648,11 @@ airo_netscan(){
     local args=(-sn "$subnet")
     [[ -n "$HOST_TIMEOUT" ]] && args+=(--host-timeout "$HOST_TIMEOUT")
     if [[ -n "$OUTFILE" ]]; then
-        nmap_with_grc "${args[@]}" -oN "$OUTFILE" || true
-        echo "[+] Results saved to $OUTFILE"
+        if nmap_with_grc "${args[@]}" -oN "$OUTFILE"; then
+            echo "[+] Results saved to $OUTFILE"
+        else
+            warn "Host discovery failed; output not saved"
+        fi
     else
         nmap_with_grc "${args[@]}" || true
     fi
@@ -1639,13 +1666,21 @@ airo_portscan() {
     
     echo "[*] Scanning $target..."
     require_cmd nmap "Install nmap or run the dependency installer." || return 1
-    local args=(-sS -T4 "$target")
+    local scan_type="-sS"
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        scan_type="-sT"
+        warn "Running unprivileged TCP connect scan (-sT); use sudo for SYN scan."
+    fi
+    local args=("$scan_type" -T4 "$target")
     [[ -n "$PORTS" ]] && args+=(-p "$PORTS")
     [[ -n "$TOP_PORTS" ]] && args+=(--top-ports "$TOP_PORTS")
     [[ -n "$HOST_TIMEOUT" ]] && args+=(--host-timeout "$HOST_TIMEOUT")
     if [[ -n "$OUTFILE" ]]; then
-        nmap_with_grc "${args[@]}" -oN "$OUTFILE" || true
-        echo "[+] Results saved to $OUTFILE"
+        if nmap_with_grc "${args[@]}" -oN "$OUTFILE"; then
+            echo "[+] Results saved to $OUTFILE"
+        else
+            warn "Port scan failed; output not saved"
+        fi
     else
         nmap_with_grc "${args[@]}" || true
     fi
@@ -1659,13 +1694,20 @@ airo_udpscan() {
     
     echo "[*] UDP scan on $target..."
     require_cmd nmap "Install nmap or run the dependency installer." || return 1
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]] && ! command -v sudo >/dev/null 2>&1; then
+        warn "UDP scan requires root privileges; install sudo or run as root."
+        return 1
+    fi
     local args=(-sU -T4 "$target")
     [[ -n "$PORTS" ]] && args+=(-p "$PORTS")
     [[ -n "$TOP_PORTS" ]] && args+=(--top-ports "$TOP_PORTS")
     [[ -n "$HOST_TIMEOUT" ]] && args+=(--host-timeout "$HOST_TIMEOUT")
     if [[ -n "$OUTFILE" ]]; then
-        sudo_nmap_with_grc "${args[@]}" -oN "$OUTFILE" || true
-        echo "[+] Results saved to $OUTFILE"
+        if sudo_nmap_with_grc "${args[@]}" -oN "$OUTFILE"; then
+            echo "[+] Results saved to $OUTFILE"
+        else
+            warn "UDP scan failed; output not saved"
+        fi
     else
         sudo_nmap_with_grc "${args[@]}" || true
     fi
@@ -1702,7 +1744,7 @@ airo_dnscan() {
     # Simple subdomain brute force
     local words=(www ftp mail admin test dev staging api)
     for word in "${words[@]}"; do
-        host "$word.$domain" 2>/dev/null | grep -v "NXDOMAIN" || true
+        host "$word.$domain" 2>&1 | grep -v "NXDOMAIN" || true
     done
 }
 
@@ -1869,6 +1911,23 @@ ensure_wordlist() {
     local path="$1"
     if [[ ! -f "$path" ]]; then
         echo "[-] Wordlist not found: $path"
+        if [[ "${AUTO_INSTALL_DEPS:-0}" == "1" ]]; then
+            if command -v git >/dev/null 2>&1; then
+                if [[ "${NO_PROMPT:-0}" -ne 1 && -t 0 && "${AIRO_YES:-0}" != "1" ]]; then
+                    read -p "[?] Clone SecLists to $WORDLIST_BASE now? [y/N]: " -r
+                    [[ $REPLY =~ ^[Yy]$ ]] || return 1
+                fi
+                mkdir -p "$WORDLIST_BASE" 2>/dev/null || true
+                if [[ ! -d "$WORDLIST_BASE/.git" ]]; then
+                    git clone https://github.com/danielmiessler/SecLists.git "$WORDLIST_BASE" || true
+                fi
+                if [[ -f "$path" ]]; then
+                    return 0
+                fi
+            else
+                warn "Missing tool: git"
+            fi
+        fi
         echo "[!] Clone SecLists: git clone https://github.com/danielmiessler/SecLists.git \"$WORDLIST_BASE\""
         return 1
     fi
@@ -2073,7 +2132,12 @@ airo_sqlcheck() {
     echo "[*] Testing $url for SQL injection..."
     
     require_cmd sqlmap "Install sqlmap or run the dependency installer." || return 1
-    sqlmap -u "$url" --batch || true
+    local sqlmap_args=(--batch --answers="proceed=C,reduce=Y,continue=Y")
+    if [[ -n "${SQLMAP_OPTS-}" ]]; then
+        read -r -a sqlmap_user_opts <<< "$SQLMAP_OPTS"
+        sqlmap_args+=("${sqlmap_user_opts[@]}")
+    fi
+    sqlmap -u "$url" "${sqlmap_args[@]}" || true
 }
 
 airo_xsscheck() {
@@ -4050,6 +4114,51 @@ REPORT_TEMPLATE
             echo "- Provide --source <dir> to link outputs"
         fi
         echo ""
+        echo "## Automated Findings (Draft)"
+        if [[ -n "$source_dir" ]]; then
+            local findings=()
+            if [[ -f "$source_dir/webscan.txt" ]]; then
+                if grep -qi "X-Frame-Options header is not present" "$source_dir/webscan.txt"; then
+                    findings+=("Missing X-Frame-Options header (Nikto)")
+                fi
+            fi
+            if [[ -f "$source_dir/headers.txt" ]]; then
+                if grep -qi "^cf-mitigated: challenge" "$source_dir/headers.txt"; then
+                    findings+=("WAF challenge detected (cf-mitigated)")
+                fi
+            fi
+            if [[ -f "$source_dir/xsscheck.txt" ]]; then
+                local reflected
+                reflected="$(grep -oE "Reflected parameter: [^[:space:]]+" "$source_dir/xsscheck.txt" | head -1 || true)"
+                if [[ -n "$reflected" ]]; then
+                    findings+=("$reflected (potential reflected XSS)")
+                fi
+            fi
+            if [[ -f "$source_dir/sqlcheck.txt" ]]; then
+                if grep -qi "does not seem to be injectable" "$source_dir/sqlcheck.txt"; then
+                    findings+=("SQLi not detected for tested parameter (sqlmap)")
+                elif grep -qi "is injectable" "$source_dir/sqlcheck.txt"; then
+                    findings+=("SQLi indicators detected by sqlmap")
+                fi
+            fi
+            if [[ -f "$source_dir/nuclei.txt" ]]; then
+                local nuclei_count
+                nuclei_count="$(grep -c '.' "$source_dir/nuclei.txt" 2>/dev/null || true)"
+                if [[ "$nuclei_count" -gt 0 ]]; then
+                    findings+=("Nuclei findings: $nuclei_count entries")
+                fi
+            fi
+            if (( ${#findings[@]} > 0 )); then
+                for finding in "${findings[@]}"; do
+                    echo "- $finding"
+                done
+            else
+                echo "- No automated findings detected"
+            fi
+        else
+            echo "- Provide --source <dir> to generate draft findings"
+        fi
+        echo ""
         echo "## Run Logs"
         if [[ -f "$AIRO_CACHE/logs/commands.jsonl" ]]; then
             echo "- Command log: $AIRO_CACHE/logs/commands.jsonl"
@@ -4060,6 +4169,13 @@ REPORT_TEMPLATE
             echo "- Error log: $AIRO_CACHE/logs/airo.log"
         else
             echo "- Error log: (not found)"
+        fi
+        local runlist_log=""
+        runlist_log="$(ls -t "$AIRO_CACHE"/logs/runlist-*.log 2>/dev/null | head -1 || true)"
+        if [[ -n "$runlist_log" ]]; then
+            echo "- Runlist log: $runlist_log"
+        else
+            echo "- Runlist log: (not found)"
         fi
     } >> "$report_dir/report_template.md"
     
